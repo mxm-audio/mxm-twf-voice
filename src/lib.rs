@@ -13,9 +13,10 @@
 //! **The sections, each exactly off at level 0 (not run, so it costs nothing and changes nothing):**
 //! - *Body*: an oscillator, a sine shaped toward a triangle, whose pitch drops as a
 //!   current-controlled oscillator's does, linear in hertz: `f = f_rest·(1 + k·e^(−t/τ))`
-//!   (`docs/drum-model-fitting.md` §6; an exponential sweep in semitones does not fit a drum
-//!   machine's kick). Its level rises linearly over its attack — nothing starts at its peak (§6) —
-//!   and falls in two stages, a first with its own T60 and a share `tail` falling with a second.
+//!   (mxm-drum-machine's `docs/drum-model-fitting.md` §6; an exponential sweep in semitones does
+//!   not fit a drum machine's kick). Its level rises linearly over its attack — nothing starts at
+//!   its peak (§6) — and falls in two stages, a first with its own T60 and a share `tail` falling
+//!   with a second.
 //!   Its own drive, `tanh(d·x)/d`, after the strike's velocity, so a harder strike saturates more.
 //! - *Second oscillator*: a sine with its own rest pitch, drop, attack and T60.
 //! - *Partials*: up to thirty-two sines, the drum's lines, each with its level, its ratio to the body's
@@ -41,10 +42,10 @@
 //!   Virtuosity's hard hit, 45 audible differences against another hit, 49 for the curves.
 //!
 //! **Filters (published).** The band-passes and the low cut are the trapezoidal state-variable filter
-//! (`docs/filters/02-topologies.md` §2.2: Simper's linear trapezoidal SVF, Zavalishin's TPT SVF, *The
-//! Art of VA Filter Design* ch. 4), prewarped with `g = tan(π·fc/fs)`; the band-pass is its band
-//! output times `1/Q`, unity at its centre, and the low cut its high-pass output at `Q = 1/√2`, the
-//! second-order Butterworth.
+//! (mxm-kit's `docs/filters/02-topologies.md` §2.2: Simper's linear trapezoidal SVF, Zavalishin's
+//! TPT SVF, *The Art of VA Filter Design* ch. 4), prewarped with `g = tan(π·fc/fs)`; the band-pass
+//! is its band output times `1/Q`, unity at its centre, and the low cut its high-pass output at
+//! `Q = 1/√2`, the second-order Butterworth.
 //!
 //! **Velocity (chosen law).** Every section's level follows the strike's velocity `v`, and each of a
 //! section's routes moves one of its parameters by `route` octaves per unit of velocity about
