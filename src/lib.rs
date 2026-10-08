@@ -40,6 +40,8 @@
 //!   (a drum's ring sinks as it dies) with its own rise and two stages. Fitted to what a recorded
 //!   kick's lines leave, 32 numbers came closer than the same bands' measured curves (390 numbers):
 //!   Virtuosity's hard hit, 45 audible differences against another hit, 49 for the curves.
+//! - *Wires*, a snare's, in the animated filter's bands: a broad band of its own heard from the wires'
+//!   first return on (see `Wires`).
 //!
 //! **Filters (published).** The band-passes and the low cut are the trapezoidal state-variable filter
 //! (mxm-kit's `docs/filters/02-topologies.md` §2.2: Simper's linear trapezoidal SVF, Zavalishin's
@@ -228,16 +230,33 @@ pub struct Contact {
     pub rise_s: f64,
 }
 
+/// A snare's wires: a broad band of their own, `band`, its time counted from `delay_s`, nothing before.
+///
+/// The wires leave the snare-side head at the strike and slap it again when they return; the head
+/// radiates the slaps, a band the strike does not have (`research:physical-modelling/snare-wires.md`
+/// §2.3, §2.8; the owner, 2026-10-08: "not internal noise from the drum skin? That the wires cause?").
+/// Virtuosity's snare, wires on against off at matched layers: 20–39 dB more above 4 kHz, from 10 ms
+/// after a soft strike and 13–15 ms after a hard one, falling twice as fast after the soft one, while
+/// the head's lowest mode loses 20 dB more by 45 ms. The band does not pulse with the head: its 4–12
+/// kHz level folded over the head's cycle varies 1.4–2.3 dB with the wires and 2.3–3.0 without. So a
+/// law carries it, and it costs nothing a sample beyond the bands it keeps sounding.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Wires {
+    pub band: Broad,
+    pub delay_s: f64,
+}
+
 /// The animated filter: white noise through third-octave bands whose levels follow a law, a broad
-/// band, the strike's contact and the rings, `level` (linear) on top of it, 0 off. The contact is
-/// the strike's alone, so the ring's law is not spent on it (fitted from the strike together, the
-/// rings went to +33 dB bursts dying in 3 ms instead of Virtuosity's ring near 560 Hz).
+/// band, the strike's contact, the rings and a snare's wires, `level` (linear) on top of it, 0 off.
+/// The contact is the strike's alone, so the ring's law is not spent on it (fitted from the strike
+/// together, the rings went to +33 dB bursts dying in 3 ms instead of Virtuosity's ring near 560 Hz).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Bank {
     pub level: f64,
     pub broad: Broad,
     pub contact: Contact,
     pub rings: [Ring; RINGS],
+    pub wires: Wires,
     /// Route: its level.
     pub vel_level: f64,
 }
@@ -275,9 +294,23 @@ impl Default for Bank {
                 tail: 0.0,
                 tail_s: 1.0,
             }; RINGS],
+            wires: Wires {
+                band: off,
+                delay_s: 0.01,
+            },
             vel_level: 0.0,
         }
     }
+}
+
+/// A broad band's level at `x` octaves from 500 Hz, `t` s into its course, dB.
+fn broad_db(b: &Broad, x: f64, t: f64) -> f64 {
+    b.level_db
+        + b.slope_db * x
+        + b.curve_db * x * x
+        + rise_db(t, b.rise_s)
+        + stages_db(t, b.t60_s, b.tail, b.tail_s)
+        + b.tilt_db * x * (1.0 - (-t / b.tilt_s.max(1e-4)).exp())
 }
 
 /// Two stages in power, dB: `(1 − a)·10^(−6t/T1) + a·10^(−6t/T2)`, each falling 60 dB in its T60.
@@ -313,16 +346,8 @@ impl Bank {
             let db = c.level_db[k] + rise_db(t, c.rise_s) - 60.0 * t / c.t60_s[k].max(1e-4);
             power += 10f64.powf(db / 10.0);
         }
-        for b in [&self.broad] {
-            if b.level_db > BANK_OFF_DB {
-                let db = b.level_db
-                    + b.slope_db * x
-                    + b.curve_db * x * x
-                    + rise_db(t, b.rise_s)
-                    + stages_db(t, b.t60_s, b.tail, b.tail_s)
-                    + b.tilt_db * x * (1.0 - (-t / b.tilt_s.max(1e-4)).exp());
-                power += 10f64.powf(db / 10.0);
-            }
+        if self.broad.level_db > BANK_OFF_DB {
+            power += 10f64.powf(broad_db(&self.broad, x, t) / 10.0);
         }
         for r in &self.rings {
             if r.level_db <= BANK_OFF_DB {
@@ -335,6 +360,10 @@ impl Bank {
                 r.level_db + shape + rise_db(t, r.rise_s) + stages_db(t, r.t60_s, r.tail, r.tail_s);
             power += 10f64.powf(db / 10.0);
         }
+        let w = &self.wires;
+        if w.band.level_db > BANK_OFF_DB && t >= w.delay_s {
+            power += 10f64.powf(broad_db(&w.band, x, t - w.delay_s) / 10.0);
+        }
         if power > 0.0 {
             10.0 * power.log10()
         } else {
@@ -343,10 +372,16 @@ impl Bank {
     }
 
     fn rises(&self) -> f64 {
+        let wires = if self.wires.band.level_db > BANK_OFF_DB {
+            self.wires.delay_s + self.wires.band.rise_s
+        } else {
+            0.0
+        };
         self.rings
             .iter()
             .map(|r| r.rise_s)
             .fold(self.broad.rise_s.max(self.contact.rise_s), f64::max)
+            .max(wires)
     }
 }
 
@@ -796,6 +831,10 @@ pub struct SynthKickSpec {
     pub low_cut_hz: f64,
     /// The noise's seed: a render is reproducible, and a fit can be read at other seeds.
     pub seed: u64,
+    /// New noise every strike: each strike after a voice's first moves the seed on, so a roll's hits
+    /// are not one noise again and again, as a snare's wires never land the same way twice. A voice
+    /// built again starts from `seed`; off, every strike is the first's noise.
+    pub fresh_noise: bool,
     pub output_gain: f64,
 }
 
@@ -864,6 +903,7 @@ impl Default for SynthKickSpec {
             velocity: Controls::default(),
             low_cut_hz: 0.0,
             seed: 1,
+            fresh_noise: false,
             output_gain: 1.0,
         }
     }
@@ -1105,6 +1145,11 @@ pub struct Controls {
     /// Times: brightness — the tables' low-pass corners, and each doubling tilts the noise 3 dB an
     /// octave up (**chosen**).
     pub tone: f64,
+    /// dB: a snare's wires' level; times: their fall (both stages) and their return. A softer strike
+    /// launches them less far: they return sooner and fall sooner (see `Wires`).
+    pub wires_db: f64,
+    pub wires_decay: f64,
+    pub wires_delay: f64,
 }
 
 impl Default for Controls {
@@ -1121,6 +1166,9 @@ impl Default for Controls {
             noise_db: 0.0,
             noise_decay: 1.0,
             tone: 1.0,
+            wires_db: 0.0,
+            wires_decay: 1.0,
+            wires_delay: 1.0,
         }
     }
 }
@@ -1144,6 +1192,9 @@ impl Controls {
             noise_db: add(self.noise_db, other.noise_db),
             noise_decay: mul(self.noise_decay, other.noise_decay),
             tone: mul(self.tone, other.tone),
+            wires_db: add(self.wires_db, other.wires_db),
+            wires_decay: mul(self.wires_decay, other.wires_decay),
+            wires_delay: mul(self.wires_delay, other.wires_delay),
         }
     }
 
@@ -1167,6 +1218,9 @@ impl Controls {
             noise_db: self.noise_db * k,
             noise_decay: mul(self.noise_decay),
             tone: mul(self.tone),
+            wires_db: self.wires_db * k,
+            wires_decay: mul(self.wires_decay),
+            wires_delay: mul(self.wires_delay),
         }
     }
 
@@ -1185,6 +1239,9 @@ impl Controls {
             noise_db: self.noise_db + other.noise_db,
             noise_decay: self.noise_decay * other.noise_decay,
             tone: self.tone * other.tone,
+            wires_db: self.wires_db + other.wires_db,
+            wires_decay: self.wires_decay * other.wires_decay,
+            wires_delay: self.wires_delay * other.wires_delay,
         }
     }
 
@@ -1233,6 +1290,14 @@ impl Controls {
                 *db += 6.0 * hardness.log2();
             }
         }
+        let w = &mut b.wires;
+        if w.band.level_db > BANK_OFF_DB {
+            w.band.level_db += self.wires_db;
+        }
+        w.band.t60_s *= self.wires_decay;
+        w.band.tail_s *= self.wires_decay;
+        w.band.slope_db += 3.0 * tone.log2();
+        w.delay_s *= self.wires_delay;
         s
     }
 }
@@ -1242,6 +1307,9 @@ const CLICK_SEED: u64 = 0;
 const NOISE_SEED: u64 = 0x5851_F42D_4C95_7F2D;
 const NOISE2_SEED: u64 = 0x2545_F491_4F6C_DD1D;
 const BANK_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+/// How far each strike moves the seed with `fresh_noise`: an odd constant, so no two strikes of the
+/// first 2^64 share one.
+const STRIKE_SEED: u64 = 0xD1B5_4A32_D192_ED03;
 
 /// A synthesized kick voice.
 #[derive(Debug, Clone)]
@@ -1253,6 +1321,8 @@ pub struct SynthKick {
     dt: f64,
     velocity: f64,
     age: u64,
+    /// Strikes since the voice was built: `fresh_noise` moves the seed by them.
+    strikes: u64,
     // The body.
     body_level: f64,
     body_drop: f64,
@@ -1312,6 +1382,7 @@ impl SynthKick {
             dt: 1.0 / sample_rate,
             velocity: 0.0,
             age: 0,
+            strikes: 0,
             body_level: 0.0,
             body_drop: 0.0,
             body_drop_env: 0.0,
@@ -1391,10 +1462,16 @@ impl SynthKick {
         self.partial_drop_env = 1.0;
         self.partial_drop_fall = drop_fall(p.drop_s);
 
-        self.click = NoiseRun::start(&s.click, v, s.seed.wrapping_add(CLICK_SEED), fs);
-        self.noise = NoiseRun::start(&s.noise, v, s.seed.wrapping_add(NOISE_SEED), fs);
-        self.noise2 = NoiseRun::start(&s.noise2, v, s.seed.wrapping_add(NOISE2_SEED), fs);
-        self.bank.start(&s.bank, v, s.seed.wrapping_add(BANK_SEED));
+        let seed = if s.fresh_noise {
+            s.seed.wrapping_add(self.strikes.wrapping_mul(STRIKE_SEED))
+        } else {
+            s.seed
+        };
+        self.strikes = self.strikes.wrapping_add(1);
+        self.click = NoiseRun::start(&s.click, v, seed.wrapping_add(CLICK_SEED), fs);
+        self.noise = NoiseRun::start(&s.noise, v, seed.wrapping_add(NOISE_SEED), fs);
+        self.noise2 = NoiseRun::start(&s.noise2, v, seed.wrapping_add(NOISE2_SEED), fs);
+        self.bank.start(&s.bank, v, seed.wrapping_add(BANK_SEED));
         for (run, table) in self.tables.iter_mut().zip(&s.tables) {
             run.start(table, v, fs);
         }
