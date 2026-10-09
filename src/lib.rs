@@ -838,6 +838,10 @@ pub struct SynthKickSpec {
     /// and these (`v = 0`) — softer darker, less click, less pitch drop, as a player's softer stroke
     /// (the owner's controls, 2026-09-30). Neutral: no response beyond the level.
     pub velocity: Controls,
+    /// A middle strike between the hardest and the softest, off by default: a drum whose middle
+    /// strike is not on the line between them (Big Rusty's pillowed kick: damped as much at a medium
+    /// strike as at a hard one, only a soft one ringing longer).
+    pub middle: Middle,
     /// The recording chain's low cut on the mix, Hz: 0 none.
     pub low_cut_hz: f64,
     /// The noise's seed: a render is reproducible, and a fit can be read at other seeds.
@@ -912,6 +916,7 @@ impl Default for SynthKickSpec {
             bank: Bank::default(),
             tables: [Table::default(); TABLES],
             velocity: Controls::default(),
+            middle: Middle::default(),
             low_cut_hz: 0.0,
             seed: 1,
             fresh_noise: false,
@@ -1161,6 +1166,26 @@ pub struct Controls {
     pub wires_db: f64,
     pub wires_decay: f64,
     pub wires_delay: f64,
+}
+
+/// The controls at a middle strike (`SynthKickSpec::middle`): at `velocity` a strike plays
+/// `controls`; above it a strike sits between the preset and them, below it between them and the
+/// softest strike's. Off at `velocity` 0, where a strike sits between the preset and the softest's
+/// in one line. Set to that line's own controls at its velocity, it plays as off, but for rounding.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Middle {
+    pub velocity: f64,
+    pub controls: Controls,
+}
+
+impl Default for Middle {
+    /// Off.
+    fn default() -> Self {
+        Self {
+            velocity: 0.0,
+            controls: Controls::default(),
+        }
+    }
 }
 
 impl Default for Controls {
@@ -1434,9 +1459,18 @@ impl SynthKick {
     pub fn strike_with(&mut self, controls: &Controls, reach: f64, velocity: f64) {
         let v = velocity.clamp(0.0, 1.0);
         let soft = self.preset.velocity.scaled(reach);
-        self.spec = controls
-            .and(&Controls::default().toward(&soft, 1.0 - v))
-            .apply(&self.preset);
+        let m = &self.preset.middle;
+        let struck = if m.velocity > 0.0 && m.velocity < 1.0 {
+            let middle = m.controls.scaled(reach);
+            if v >= m.velocity {
+                Controls::default().toward(&middle, (1.0 - v) / (1.0 - m.velocity))
+            } else {
+                middle.toward(&soft, (m.velocity - v) / m.velocity)
+            }
+        } else {
+            Controls::default().toward(&soft, 1.0 - v)
+        };
+        self.spec = controls.and(&struck).apply(&self.preset);
         let s = self.spec;
         let fs = self.sample_rate;
         let drop_fall = |seconds: f64| (-self.dt / seconds.max(1e-4)).exp();
