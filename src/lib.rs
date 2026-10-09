@@ -666,6 +666,11 @@ pub struct Table {
     pub drop2: f64,
     pub drop2_s: f64,
     pub attack_s: f64,
+    /// The level at the strike, as a share of the level the attack rises to: 0 rises from silence;
+    /// above it the table swells over its attack, as a snare's resonant head does, driven through
+    /// the shell's air (Virtuosity's wires-off snare: its 335 Hz line 3.4 dB up over 49 ms, read as
+    /// falling from the strike 5–10 dB loud there).
+    pub swell: f64,
     pub t60_s: f64,
     pub tail: f64,
     pub tail_s: f64,
@@ -696,6 +701,7 @@ impl Default for Table {
             drop2: 0.0,
             drop2_s: 0.004,
             attack_s: 0.001,
+            swell: 0.0,
             t60_s: 0.5,
             tail: 0.0,
             tail_s: 1.0,
@@ -804,7 +810,9 @@ impl TableRun {
         self.phase = (self.phase + self.base * pitch / sample_rate).fract();
         self.drop_env *= self.drop_fall;
         self.drop2_env *= self.drop2_fall;
-        let env = rise(age, spec.attack_s * sample_rate) * (self.first + self.second);
+        let swell = spec.swell.clamp(0.0, 1.0);
+        let env = (swell + (1.0 - swell) * rise(age, spec.attack_s * sample_rate))
+            * (self.first + self.second);
         self.first *= self.first_fall;
         self.second *= self.second_fall;
         self.lp.low(self.level * env * wave)
