@@ -625,8 +625,11 @@ impl BankRun {
 
 /// Overtones a table holds.
 pub const OVERTONES: usize = 8;
-/// Tables the voice holds: by default a body, a second skin and a long ring.
-pub const TABLES: usize = 3;
+/// Tables the voice holds. The Ringing kick plays three — a body, a second skin and a long ring —
+/// and leaves the fourth off; built from their recordings, the kick and both snares start closer in
+/// four (`plans/plan-synth-snare.md`, revision 10). An off table has no period and costs a test a
+/// sample.
+pub const TABLES: usize = 4;
 /// Samples in one period of a table, at every rate: at the finest step the highest overtone still
 /// has tens of samples a cycle for the linear read.
 const TABLE_LEN: usize = 1 << 17;
