@@ -823,6 +823,712 @@ impl TableRun {
     }
 }
 
+/// A cymbal's ring in fourteen bands (`Metal`): what the model-drums plan measured on Big Rusty's
+/// cymbals (revisions 13–15) — noise alone is too flat, partials alone too peaky, and what holds is
+/// many partials over a floor, every partial following its band's level, each band's level a curve
+/// over the whole ring. Measured on its crash against a second strike (flatness 1.2 dB off), the
+/// cymbal's own 905 partials read 2.7 dB off and as many scattered at random in their bands 2.8, so
+/// the bands scatter theirs, by seed; filtered noise read 7.9 and FM 10.3.
+/// From 50 Hz: a crash's strike holds as much below 150 Hz in its first 30 ms as above it.
+pub const METAL_BANDS: usize = 14;
+/// The points each band's level curve passes through.
+pub const METAL_KNOTS: usize = 10;
+/// The points' times, s: close through the strike, wider as the ring slows.
+pub const METAL_KNOT_S: [f64; METAL_KNOTS] =
+    [0.0, 0.002, 0.007, 0.02, 0.06, 0.17, 0.5, 1.5, 4.0, 8.0];
+/// The lines read exactly rather than scattered: a sparse band's, whose few scattered partials beat
+/// at random rates, and the strongest low ones.
+pub const METAL_EXACT: usize = 128;
+/// A band table's period, s: its partials sit on multiples of its inverse (rounded at most a quarter
+/// of a hertz), so the table loops without a seam however many it holds. Each band has its own,
+/// between 1.6 and 2.4 s, so the bands' repeats never fall together (the owner, 2026-10-10: the
+/// loops staggered, "like this").
+#[must_use]
+pub fn metal_period_s(band: usize) -> f64 {
+    // The golden ratio's multiples, folded: the periods spread evenly, none twice.
+    let golden = 0.618_033_988_749_894_9;
+    1.6 + 0.8 * (band as f64 * golden).fract()
+}
+/// A band table's length: 54 613 to 81 920 samples a second as its period goes, room for partials
+/// up to 27 kHz.
+const METAL_LEN: usize = 1 << 17;
+/// After its last point a band falls at least this fast, dB a second, so every ring ends.
+const METAL_TAIL_DB_S: f64 = 6.0;
+/// A band's table starts where its first 20 ms, and the 60 after, sound at its mean level. A band
+/// of a few close lines beats, and where its loop started set the crash's 417–638 Hz band 4 dB
+/// under the recording through its first 80 ms, or 3 over.
+const CALM_S: [f64; 2] = [0.02, 0.08];
+/// Of this many places evenly round the table, the calmest this many.
+const CALM_TRIED: usize = 512;
+const CALM_KEPT: usize = 16;
+/// The tick's low cut, Hz: a fourth-order Butterworth high-pass, whose two sections' Q are
+/// `TICK_CUT_Q`. A Gaussian's spectrum is flat to DC, and the crash's 50–117 Hz stood 20–33 dB over
+/// the recording's through the strike (the owner, 2026-10-11: "too low", "too dark"); the cut takes
+/// 52, 38, 23 and 9 dB of it from the four lowest bands and nothing above 417 Hz. A Ricker wavelet
+/// instead, its peak between samples, lost the attack to the ring (82 established differences on
+/// the crash's hardest layer, the cut Gaussian 77).
+const TICK_CUT_HZ: f64 = 300.0;
+const TICK_CUT_Q: [f64; 2] = [0.541_196_100_146_197, 1.306_562_964_876_376_6];
+/// The cut rings this long after the spike, s, and is then not run.
+const TICK_RING_S: f64 = 0.02;
+
+/// One band of the metal: its scattered partials, the noise between them, and its level over time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MetalBand {
+    /// How many partials are scattered in the band (rounded); none, and the band is its floor.
+    pub partials: f64,
+    /// Their levels' spread, dB: a log-normal's standard deviation around their mean.
+    pub spread_db: f64,
+    /// The share of the band's power that is noise, between the partials, 0–1.
+    pub floor: f64,
+    /// The band's level at each point of `METAL_KNOT_S`, dB.
+    pub curve_db: [f64; METAL_KNOTS],
+    /// The points' times taken this many times: 1 as read, the controls' decay moves it.
+    pub stretch: f64,
+}
+
+impl Default for MetalBand {
+    fn default() -> Self {
+        Self {
+            partials: 0.0,
+            spread_db: 6.0,
+            floor: 0.0,
+            curve_db: [-120.0; METAL_KNOTS],
+            stretch: 1.0,
+        }
+    }
+}
+
+/// The bands' levels over time as a softer strike reads them: how the balance between the bands
+/// moves with the strike, which the velocity's controls, one tilt over all the bands, could not
+/// follow (the owner, 2026-10-11: the soft hits "off pitch/resonance", "more muddy"; the open
+/// hi-hat's soft 273–638 Hz rang 14–20 dB over its take's). Its tables' likewise: stepped by the
+/// controls, the open hi-hat's soft 654 and 507 Hz rang as long as its 645, which alone rings in the
+/// take, and beat with it 9 times a second ("the model looks more on and off").
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MetalSofter {
+    /// The strike's velocity, 0–1; 0, none.
+    pub velocity: f64,
+    /// Each band's `MetalBand::curve_db` at it, its overall level the hardest's.
+    pub curve_db: [[f64; METAL_KNOTS]; METAL_BANDS],
+    /// The tick's peak at it, as `Metal::strike`.
+    pub strike: f64,
+    /// Each table's level at it against the hardest's, dB, the overall level the hardest's; and
+    /// its T60s', a factor.
+    pub tables_db: [f64; TABLES],
+    pub tables_decay: [f64; TABLES],
+    /// Its own tone (`MetalTone`). A softer strike rings its own lines clean where the hardest's
+    /// are buried in noise: the crash's soft 2182, 2986 and 3366 Hz stood 38–45 dB over their floor
+    /// and 14–36 dB over the hardest's tables there (the owner, 2026-10-12: "you are constantly
+    /// missing the pitch part", "the balance on the tone"). None, the hardest's tables play it.
+    /// Held by reference: a patch is copied at every strike, and four kilobytes more in each copy
+    /// overflowed a debug build's two-megabyte stack through the plugin's `process`.
+    pub tone: Option<&'static MetalTone>,
+}
+
+/// A reading's tone, as the hardest's is in `MetalBand` and `Metal`: each band's scattered
+/// partials, their spread and the noise between, and the exact lines.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetalTone {
+    pub partials: [f64; METAL_BANDS],
+    pub spread_db: [f64; METAL_BANDS],
+    pub floor: [f64; METAL_BANDS],
+    pub exact_hz: [f64; METAL_EXACT],
+    pub exact_db: [f64; METAL_EXACT],
+}
+
+impl Default for MetalTone {
+    fn default() -> Self {
+        Self {
+            partials: [0.0; METAL_BANDS],
+            spread_db: [6.0; METAL_BANDS],
+            floor: [0.0; METAL_BANDS],
+            exact_hz: [0.0; METAL_EXACT],
+            exact_db: [0.0; METAL_EXACT],
+        }
+    }
+}
+
+impl Default for MetalSofter {
+    fn default() -> Self {
+        Self {
+            velocity: 0.0,
+            curve_db: [[-120.0; METAL_KNOTS]; METAL_BANDS],
+            strike: 0.0,
+            tables_db: [0.0; TABLES],
+            tables_decay: [1.0; TABLES],
+            tone: None,
+        }
+    }
+}
+
+/// A cymbal's ring: fourteen bands between `lo_hz` and `hi_hz`, geometric, each a table of its
+/// partials and the noise between them under its own level curve. Off at level 0.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Metal {
+    /// Linear; 0 off.
+    pub level: f64,
+    pub lo_hz: f64,
+    pub hi_hz: f64,
+    pub bands: [MetalBand; METAL_BANDS],
+    /// The exact lines, Hz (0 none), each in the band it falls in; their levels, dB against that
+    /// band's scattered partials' mean.
+    pub exact_hz: [f64; METAL_EXACT],
+    pub exact_db: [f64; METAL_EXACT],
+    /// How fast the tables play: 1 as read, the controls' tune moves it.
+    pub rate: f64,
+    /// Where the scattered partials fall.
+    pub seed: u64,
+    /// The stick's tick: a Gaussian pulse at the strike less its lows (`TICK_CUT_HZ`), its peak
+    /// (signed) and its width σ, s. A crash's strike is one spike 0.07 ms in, 22–27 dB over the ring
+    /// that follows; the bands, a few milliseconds apart, cannot make it, and the listener reads the
+    /// attack against it: without it the crash read 86 established differences against 78. The peak
+    /// is the one read, the cut's loss scaled back.
+    pub strike: f64,
+    pub strike_s: f64,
+    /// The softest strike's reading, then the middle's; the hardest's is the bands' own, at 1.
+    pub softer: [MetalSofter; 2],
+}
+
+impl Default for Metal {
+    fn default() -> Self {
+        Self {
+            level: 0.0,
+            lo_hz: 50.0,
+            hi_hz: 19_000.0,
+            bands: [MetalBand::default(); METAL_BANDS],
+            exact_hz: [0.0; METAL_EXACT],
+            exact_db: [0.0; METAL_EXACT],
+            rate: 1.0,
+            seed: 1,
+            strike: 0.0,
+            strike_s: 3e-5,
+            softer: [MetalSofter::default(); 2],
+        }
+    }
+}
+
+impl Metal {
+    /// Band `b`'s edges, Hz, as read (before `rate`).
+    #[must_use]
+    pub fn edges(&self, b: usize) -> (f64, f64) {
+        let ratio = (self.hi_hz / self.lo_hz.max(1.0)).max(1.0);
+        let at = |k: usize| self.lo_hz * ratio.powf(k as f64 / METAL_BANDS as f64);
+        (at(b), at(b + 1))
+    }
+
+    /// Whether softer strikes were read (`softer`).
+    #[must_use]
+    pub fn reads_softer(&self) -> bool {
+        self.softer.iter().any(|s| s.velocity > 0.0)
+    }
+
+    /// The metal struck at `v`: its curves and tick between the readings either side of it, in dB
+    /// and in amplitude straight along the velocity, the softest's below it and the hardest's, at
+    /// 1, above the rest.
+    #[must_use]
+    pub fn at_velocity(&self, v: f64) -> Self {
+        let Some((a, b, w)) = self.readings_at(v) else {
+            return *self;
+        };
+        let mut m = *self;
+        for (band, (ca, cb)) in m.bands.iter_mut().zip(a.curve_db.iter().zip(&b.curve_db)) {
+            for (k, db) in band.curve_db.iter_mut().enumerate() {
+                *db = ca[k] + w * (cb[k] - ca[k]);
+            }
+        }
+        m.strike = a.strike + w * (b.strike - a.strike);
+        m
+    }
+
+    /// Each table's level (dB against the hardest's) and T60s' factor struck at `v`, between the
+    /// readings either side of it as `at_velocity`'s: the level in dB and the factor in octaves
+    /// straight along the velocity.
+    #[must_use]
+    pub fn tables_at(&self, v: f64) -> [(f64, f64); TABLES] {
+        let Some((a, b, w)) = self.readings_at(v) else {
+            return [(0.0, 1.0); TABLES];
+        };
+        std::array::from_fn(|n| {
+            let db = a.tables_db[n] + w * (b.tables_db[n] - a.tables_db[n]);
+            let (da, db_) = (a.tables_decay[n].max(1e-9), b.tables_decay[n].max(1e-9));
+            (db, da * (db_ / da).powf(w))
+        })
+    }
+
+    /// The band tables a strike at `v` plays, as `metal_tables`' sets (0 the hardest's, 1 and 2 the
+    /// softest's and the middle's own tones), and how far along from the first: the readings
+    /// either side of it as `at_velocity`'s, a reading without its own tone playing the
+    /// hardest's.
+    #[must_use]
+    pub fn tones_at(&self, v: f64) -> ([usize; 2], f64) {
+        let set = |i: usize| match self.softer.get(i) {
+            Some(s) if s.tone.is_some() => i + 1,
+            _ => 0,
+        };
+        match self.anchors_at(v) {
+            Some((a, b, w)) if set(a) != set(b) => ([set(a), set(b)], w),
+            Some((a, _, _)) => ([set(a); 2], 0.0),
+            None => ([0; 2], 0.0),
+        }
+    }
+
+    /// The readings either side of `v` and how far along from the first, the hardest's at 1;
+    /// `None` without a softer one.
+    fn readings_at(&self, v: f64) -> Option<(MetalSofter, MetalSofter, f64)> {
+        let (a, b, w) = self.anchors_at(v)?;
+        Some((self.reading(a), self.reading(b), w))
+    }
+
+    /// Reading `i`: the softest's and the middle's, then the hardest's (2).
+    fn reading(&self, i: usize) -> MetalSofter {
+        self.softer.get(i).copied().unwrap_or(MetalSofter {
+            velocity: 1.0,
+            curve_db: self.bands.map(|b| b.curve_db),
+            strike: self.strike,
+            ..MetalSofter::default()
+        })
+    }
+
+    /// `readings_at`'s, as the readings' indices (`reading`).
+    fn anchors_at(&self, v: f64) -> Option<(usize, usize, f64)> {
+        let velocity = |i: usize| if i < 2 { self.softer[i].velocity } else { 1.0 };
+        let mut lower: Option<usize> = None;
+        let mut upper: Option<usize> = None;
+        for i in (0..3).filter(|&i| velocity(i) > 0.0) {
+            if velocity(i) <= v {
+                lower = Some(i);
+            } else if upper.is_none() {
+                upper = Some(i);
+            }
+        }
+        match (lower, upper) {
+            (Some(a), Some(b)) => Some((a, b, (v - velocity(a)) / (velocity(b) - velocity(a)))),
+            (Some(a), None) => Some((a, a, 0.0)),
+            (None, Some(b)) => Some((b, b, 0.0)),
+            (None, None) => None,
+        }
+    }
+}
+
+/// An in-place radix-2 FFT of `re + i·im`, whose length is a power of two.
+fn fft(re: &mut [f64], im: &mut [f64]) {
+    let n = re.len();
+    let mut j = 0;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j |= bit;
+        if i < j {
+            re.swap(i, j);
+            im.swap(i, j);
+        }
+    }
+    let mut len = 2;
+    while len <= n {
+        let (wi, wr) = (-TAU / len as f64).sin_cos();
+        for start in (0..n).step_by(len) {
+            let (mut cr, mut ci) = (1.0, 0.0);
+            for k in 0..len / 2 {
+                let (a, b) = (start + k, start + k + len / 2);
+                let tr = re[b] * cr - im[b] * ci;
+                let ti = re[b] * ci + im[b] * cr;
+                re[b] = re[a] - tr;
+                im[b] = im[a] - ti;
+                re[a] += tr;
+                im[a] += ti;
+                (cr, ci) = (cr * wr - ci * wi, cr * wi + ci * wr);
+            }
+        }
+        len <<= 1;
+    }
+}
+
+/// The metal's band tables, one set for each reading with its own tone (`Metal::tones_at`): the
+/// hardest's, then the softest's and the middle's, empty where the reading has none.
+fn metal_tables(m: &Metal) -> Vec<Vec<MetalTable>> {
+    let hard = BandTone {
+        partials: m.bands.map(|b| b.partials),
+        spread_db: m.bands.map(|b| b.spread_db),
+        floor: m.bands.map(|b| b.floor),
+        exact_hz: &m.exact_hz,
+        exact_db: &m.exact_db,
+        seed: m.seed,
+    };
+    let mut sets = vec![band_tables(m, &hard)];
+    for (i, s) in m.softer.iter().enumerate() {
+        sets.push(match s.tone {
+            Some(t) if s.velocity > 0.0 => band_tables(
+                m,
+                &BandTone {
+                    partials: t.partials,
+                    spread_db: t.spread_db,
+                    floor: t.floor,
+                    exact_hz: &t.exact_hz,
+                    exact_db: &t.exact_db,
+                    seed: m.seed.wrapping_add(STRIKE_SEED.wrapping_mul(i as u64 + 1)),
+                },
+            ),
+            _ => Vec::new(),
+        });
+    }
+    sets
+}
+
+/// What a set of band tables holds (`band_tables`).
+struct BandTone<'a> {
+    partials: [f64; METAL_BANDS],
+    spread_db: [f64; METAL_BANDS],
+    floor: [f64; METAL_BANDS],
+    exact_hz: &'a [f64; METAL_EXACT],
+    exact_db: &'a [f64; METAL_EXACT],
+    seed: u64,
+}
+
+/// A tone's band tables, each one period of its partials and its floor at unit RMS: the
+/// scattered partials by seed (log-uniform in the band, levels log-normal), the exact lines that
+/// fall in it, and noise in every bin between. Empty for a silent band. Built once by an inverse
+/// FFT; the tables do not depend on the rate.
+fn band_tables(m: &Metal, tone: &BandTone) -> Vec<MetalTable> {
+    (0..METAL_BANDS)
+        .map(|b| {
+            let (lo, hi) = m.edges(b);
+            let mut white = White::new(
+                tone.seed
+                    .wrapping_add(METAL_SEED.wrapping_mul(b as u64 + 1)),
+            );
+            let mut uniform = || 0.5 * (white.next() + 1.0);
+            let mut lines: Vec<(f64, f64)> = Vec::new();
+            for _ in 0..tone.partials[b].round().max(0.0) as usize {
+                let hz = lo * (hi / lo).powf(uniform());
+                let (u1, u2) = (uniform().max(1e-12), uniform());
+                let z = (-2.0 * u1.ln()).sqrt() * (TAU * u2).cos();
+                lines.push((hz, 10f64.powf(tone.spread_db[b] * z / 20.0)));
+            }
+            for (&hz, &db) in tone.exact_hz.iter().zip(tone.exact_db) {
+                if hz >= lo && hz < hi {
+                    lines.push((hz, 10f64.powf(db / 20.0)));
+                }
+            }
+            let period = metal_period_s(b);
+            let floor = if lines.is_empty() {
+                1.0
+            } else {
+                tone.floor[b].clamp(0.0, 1.0)
+            };
+            let mut re = vec![0.0; METAL_LEN];
+            let mut im = vec![0.0; METAL_LEN];
+            for (hz, amp) in lines {
+                let k = ((hz * period).round() as usize).clamp(1, METAL_LEN / 2 - 1);
+                let phase = TAU * uniform();
+                // The conjugate's transform is the inverse's conjugate: its real part is the sum
+                // of the cosines.
+                re[k] += amp * phase.cos();
+                im[k] -= amp * phase.sin();
+            }
+            // The floor: noise in every bin of the band at random phases, `floor` of the band's
+            // power, all of it in a band without lines. Band-limited as the partials are: a
+            // band-pass's skirts let the stack's loud middle bands' noise into its 50–273 Hz bands,
+            // 13–39 dB over the recording's through the strike, its floors left out 1–13.
+            let bin = |hz: f64| ((hz * period).ceil() as usize).clamp(1, METAL_LEN / 2);
+            let (k0, k1) = (bin(lo), bin(hi));
+            if floor > 0.0 && k1 > k0 {
+                let lines_power: f64 = re.iter().zip(&im).map(|(r, i)| r * r + i * i).sum();
+                let wanted = if floor >= 1.0 {
+                    1.0
+                } else {
+                    lines_power * floor / (1.0 - floor)
+                };
+                // Each bin's Rayleigh amplitude has mean square twice its σ².
+                let each = (wanted / (2.0 * (k1 - k0) as f64)).sqrt();
+                for k in k0..k1 {
+                    let (u1, u2) = (uniform().max(1e-12), uniform());
+                    let r = (-2.0 * u1.ln()).sqrt() * each;
+                    re[k] += r * (TAU * u2).cos();
+                    im[k] += r * (TAU * u2).sin();
+                }
+            }
+            if re.iter().all(|v| *v == 0.0) && im.iter().all(|v| *v == 0.0) {
+                return MetalTable::default();
+            }
+            fft(&mut re, &mut im);
+            let rms = (re.iter().map(|v| v * v).sum::<f64>() / METAL_LEN as f64).sqrt();
+            let scale = if rms > 0.0 { 1.0 / rms } else { 0.0 };
+            let samples: Vec<f32> = re.iter().map(|v| (v * scale) as f32).collect();
+            let starts = calm_starts(&samples, period);
+            MetalTable {
+                samples: Arc::from(samples),
+                starts: Arc::from(starts),
+            }
+        })
+        .collect()
+}
+
+/// Where a band's table may start: of `CALM_TRIED` places evenly round it, the `CALM_KEPT` whose
+/// first `CALM_S` windows sound nearest its mean level (unit power), as the sum of their misses in
+/// dB.
+fn calm_starts(samples: &[f32], period: f64) -> Vec<u32> {
+    let n = samples.len();
+    // Squares summed from the start, twice round, so a window may wrap.
+    let mut prefix = vec![0.0f64; 2 * n + 1];
+    for i in 0..2 * n {
+        let s = f64::from(samples[i % n]);
+        prefix[i + 1] = prefix[i] + s * s;
+    }
+    let per_s = n as f64 / period;
+    let (w1, w2) = (
+        ((CALM_S[0] * per_s) as usize).clamp(1, n),
+        ((CALM_S[1] * per_s) as usize).clamp(2, n),
+    );
+    let miss = |from: usize, to: usize, at: usize| {
+        let power = (prefix[at + to] - prefix[at + from]) / (to - from) as f64;
+        (10.0 * power.max(1e-12).log10()).abs()
+    };
+    let mut tried: Vec<(f64, u32)> = (0..CALM_TRIED)
+        .map(|c| {
+            let at = c * n / CALM_TRIED;
+            (miss(0, w1, at) + miss(w1, w2.max(w1 + 1), at), at as u32)
+        })
+        .collect();
+    tried.sort_by(|a, b| a.0.total_cmp(&b.0));
+    tried.iter().take(CALM_KEPT).map(|t| t.1).collect()
+}
+
+/// One band's table, and the places it may start (`calm_starts`).
+#[derive(Debug, Clone, Default)]
+struct MetalTable {
+    samples: Arc<[f32]>,
+    starts: Arc<[u32]>,
+}
+
+/// One band of the metal sounding: its table's place, its noise filter and its level curve.
+#[derive(Debug, Clone, Copy, Default)]
+struct MetalBandRun {
+    /// The table's place and its step a sample, in table samples.
+    at: f64,
+    step: f64,
+    /// Between two readings' tones (`Metal::tones_at`), the second set's table, its place and
+    /// both tables' gains; the second's 0, it is not played.
+    second: usize,
+    at_second: f64,
+    mix: [f64; 2],
+    env: f64,
+    mult: f64,
+    knot: usize,
+    until: u64,
+    times: [u64; METAL_KNOTS],
+    gains: [f64; METAL_KNOTS],
+    tail: f64,
+}
+
+impl MetalBandRun {
+    /// The envelope one sample on, `age` the sample just played.
+    fn advance(&mut self, age: u64) {
+        if age + 1 < self.until {
+            self.env *= self.mult;
+            return;
+        }
+        self.env = self.gains[self.knot];
+        self.knot += 1;
+        if self.knot < METAL_KNOTS {
+            let span = self.times[self.knot]
+                .saturating_sub(self.times[self.knot - 1])
+                .max(1);
+            self.mult = (self.gains[self.knot] / self.env.max(1e-300)).powf(1.0 / span as f64);
+            self.until = self.times[self.knot];
+        } else {
+            self.knot = METAL_KNOTS - 1;
+            self.mult = self.tail;
+            self.until = u64::MAX;
+        }
+    }
+}
+
+/// The metal sounding. Its tables are shared, as the other tables are: a set for each reading's
+/// tone (`metal_tables`), and the one this strike plays first.
+#[derive(Debug, Clone)]
+struct MetalRun {
+    tables: Vec<Vec<MetalTable>>,
+    first: usize,
+    bands: [MetalBandRun; METAL_BANDS],
+    noise: White,
+    level: f64,
+    /// The tick's peak, its width and centre in samples.
+    strike: f64,
+    strike_w: f64,
+    strike_at: f64,
+    /// The tick's low cut, the gain that restores its peak, and the age it stops ringing at.
+    tick_cut: [Svf; 2],
+    tick_gain: f64,
+    tick_until: u64,
+    active: bool,
+}
+
+impl MetalRun {
+    fn new(tables: Vec<Vec<MetalTable>>) -> Self {
+        Self {
+            tables,
+            first: 0,
+            bands: [MetalBandRun::default(); METAL_BANDS],
+            noise: White::new(1),
+            level: 0.0,
+            strike: 0.0,
+            strike_w: 1.0,
+            strike_at: 0.0,
+            tick_cut: [Svf::default(); 2],
+            tick_gain: 0.0,
+            tick_until: 0,
+            active: false,
+        }
+    }
+
+    /// The tick's Gaussian at `age`, before its cut.
+    fn pulse(&self, age: u64) -> f64 {
+        let from_tick = (age as f64 - self.strike_at) / self.strike_w;
+        if from_tick < 3.0 {
+            (-0.5 * from_tick * from_tick).exp()
+        } else {
+            0.0
+        }
+    }
+
+    fn start(&mut self, m: &Metal, v: f64, seed: u64, sample_rate: f64) {
+        self.level = m.level;
+        self.active = m.level > 0.0 && self.tables.first().is_some_and(|t| !t.is_empty());
+        if !self.active {
+            return;
+        }
+        // The two tones either side of the strike, each set's tables uncorrelated: their powers
+        // add, so their gains are the roots of their shares.
+        let ([first, second], w) = m.tones_at(v);
+        let usable = |set: usize| self.tables.get(set).is_some_and(|t| !t.is_empty());
+        let (first, second) = (
+            if usable(first) { first } else { 0 },
+            if usable(second) { second } else { 0 },
+        );
+        let (mix, second) = if first == second || w <= 0.0 {
+            ([1.0, 0.0], first)
+        } else {
+            ([(1.0 - w).max(0.0).sqrt(), w.min(1.0).sqrt()], second)
+        };
+        self.first = first;
+        self.noise = White::new(seed);
+        self.strike = m.strike;
+        self.strike_w = (m.strike_s * sample_rate).max(1e-3);
+        self.strike_at = 3.0 * self.strike_w;
+        self.tick_cut = TICK_CUT_Q.map(|q| Svf::new(TICK_CUT_HZ, q, sample_rate));
+        // The cut lowers the spike's peak: scale it back to the peak read.
+        let mut probe = self.tick_cut;
+        let spike = (self.strike_at + 3.0 * self.strike_w).ceil() as u64 + 2;
+        let top = (0..spike)
+            .map(|age| {
+                probe
+                    .iter_mut()
+                    .fold(self.pulse(age), |v, s| s.high(v))
+                    .abs()
+            })
+            .fold(0.0f64, f64::max);
+        self.tick_gain = if top > 0.0 { 1.0 / top } else { 0.0 };
+        self.tick_until = spike + (TICK_RING_S * sample_rate) as u64;
+        for (b, run) in self.bands.iter_mut().enumerate() {
+            let band = &m.bands[b];
+            let times =
+                METAL_KNOT_S.map(|t| (t * band.stretch.max(0.0) * sample_rate).round() as u64);
+            let gains = band.curve_db.map(|db| 10f64.powf(db / 20.0));
+            let (k, j) = (METAL_KNOTS - 1, METAL_KNOTS - 2);
+            let seconds = ((times[k] - times[j]) as f64 / sample_rate).max(1e-3);
+            let slope = ((band.curve_db[k] - band.curve_db[j]) / seconds).min(-METAL_TAIL_DB_S);
+            // Where a table starts, one of its calm places by the strike's seed: a new one each
+            // strike with `fresh_noise`.
+            let noise = &mut self.noise;
+            let mut start_of = |table: &MetalTable| {
+                let starts = &table.starts;
+                let pick = (0.5 * (noise.next() + 1.0) * starts.len() as f64) as usize;
+                starts
+                    .get(pick.min(starts.len().saturating_sub(1)))
+                    .map_or(0.0, |&s| f64::from(s))
+            };
+            let at = start_of(&self.tables[first][b]);
+            let at_second = if mix[1] > 0.0 {
+                start_of(&self.tables[second][b])
+            } else {
+                0.0
+            };
+            *run = MetalBandRun {
+                at,
+                step: m.rate * METAL_LEN as f64 / (metal_period_s(b) * sample_rate),
+                second,
+                at_second,
+                mix,
+                env: gains[0],
+                mult: 1.0,
+                knot: 0,
+                until: 0,
+                times,
+                gains,
+                tail: 10f64.powf(slope / 20.0 / sample_rate),
+            };
+            run.advance(0);
+            run.env = gains[0];
+        }
+    }
+
+    fn tick(&mut self, age: u64) -> f64 {
+        if !self.active {
+            return 0.0;
+        }
+        let mut out = 0.0;
+        if age < self.tick_until {
+            let pulse = self.pulse(age);
+            let cut = self.tick_cut.iter_mut().fold(pulse, |v, s| s.high(v));
+            out += self.strike * self.tick_gain * cut;
+        }
+        let first = &self.tables[self.first];
+        for (b, (run, table)) in self.bands.iter_mut().zip(first).enumerate() {
+            let mut ring = Self::read(&table.samples, &mut run.at, run.step);
+            if run.mix[1] > 0.0 {
+                let second = &self.tables[run.second][b].samples;
+                ring = run.mix[0] * ring
+                    + run.mix[1] * Self::read(second, &mut run.at_second, run.step);
+            }
+            out += run.env * ring;
+            run.advance(age);
+        }
+        self.level * out
+    }
+
+    /// A table's sample at `at`, which moves on by `step` round it; 0 for an empty table.
+    fn read(table: &[f32], at: &mut f64, step: f64) -> f64 {
+        if table.is_empty() {
+            return 0.0;
+        }
+        // Four points, cubic (Catmull–Rom): a straight line between two leaves images of the high
+        // partials that fold into the middle bands.
+        let i = *at as usize;
+        let t = *at - i as f64;
+        let point = |k: usize| f64::from(table[(i + k + METAL_LEN - 1) % METAL_LEN]);
+        let (p0, p1, p2, p3) = (point(0), point(1), point(2), point(3));
+        *at += step;
+        if *at >= METAL_LEN as f64 {
+            *at -= METAL_LEN as f64;
+        }
+        p1 + 0.5
+            * t
+            * (p2 - p0
+                + t * (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3 + t * (3.0 * (p1 - p2) + p3 - p0)))
+    }
+
+    fn loudness(&self) -> f64 {
+        if !self.active {
+            return 0.0;
+        }
+        self.level * self.bands.iter().map(|b| b.env).fold(0.0, f64::max)
+    }
+}
+
 /// A synthesized kick's patch: its sections and the recording chain.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SynthKickSpec {
@@ -842,6 +1548,8 @@ pub struct SynthKickSpec {
     /// strike is not on the line between them (Big Rusty's pillowed kick: damped as much at a medium
     /// strike as at a hard one, only a soft one ringing longer).
     pub middle: Middle,
+    /// A cymbal's ring, off by default (`Metal`).
+    pub metal: Metal,
     /// The recording chain's low cut on the mix, Hz: 0 none.
     pub low_cut_hz: f64,
     /// The noise's seed: a render is reproducible, and a fit can be read at other seeds.
@@ -917,6 +1625,7 @@ impl Default for SynthKickSpec {
             tables: [Table::default(); TABLES],
             velocity: Controls::default(),
             middle: Middle::default(),
+            metal: Metal::default(),
             low_cut_hz: 0.0,
             seed: 1,
             fresh_noise: false,
@@ -965,6 +1674,11 @@ impl Svf {
     /// Band-pass, unity at its centre.
     fn band(&mut self, v0: f64) -> f64 {
         self.k * self.tick(v0).0
+    }
+
+    /// High-pass, unity above its corner.
+    fn high(&mut self, v0: f64) -> f64 {
+        self.tick(v0).1
     }
 
     /// Low-pass, unity below its corner.
@@ -1310,6 +2024,30 @@ impl Controls {
             t.lp_to_hz = (t.lp_to_hz * tone).min(20_000.0);
         }
         s.click.level *= gain(self.click_db);
+        if s.metal.level > 0.0 {
+            let m = &mut s.metal;
+            m.rate *= pitch;
+            m.strike *= hardness;
+            let edges: [(f64, f64); METAL_BANDS] = std::array::from_fn(|b| m.edges(b));
+            let floor_gain = gain(self.noise_db).powi(2);
+            for (b, band) in m.bands.iter_mut().enumerate() {
+                // Three bands to each of the four groups the mix and decay controls name.
+                let g = b * TABLES / METAL_BANDS;
+                band.stretch *= self.decay[g];
+                let centre = (edges[b].0 * edges[b].1).sqrt();
+                let shift = self.mix_db[g] + 3.0 * tone.log2() * (centre / 1000.0).log2();
+                for db in &mut band.curve_db {
+                    *db += shift;
+                }
+                // The strike: its first two points.
+                let lift = 6.0 * hardness.log2();
+                band.curve_db[0] += lift;
+                band.curve_db[1] += lift;
+                // Noise against partials, the band's power kept.
+                let f = band.floor;
+                band.floor = f * floor_gain / (f * floor_gain + 1.0 - f).max(1e-12);
+            }
+        }
         let b = &mut s.bank;
         b.level *= gain(self.noise_db);
         b.broad.t60_s *= self.noise_decay;
@@ -1343,6 +2081,7 @@ const CLICK_SEED: u64 = 0;
 const NOISE_SEED: u64 = 0x5851_F42D_4C95_7F2D;
 const NOISE2_SEED: u64 = 0x2545_F491_4F6C_DD1D;
 const BANK_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+const METAL_SEED: u64 = 0x94D0_49BB_1331_11EB;
 /// How far each strike moves the seed with `fresh_noise`: an odd constant, so no two strikes of the
 /// first 2^64 share one.
 const STRIKE_SEED: u64 = 0xD1B5_4A32_D192_ED03;
@@ -1382,6 +2121,7 @@ pub struct SynthKick {
     noise2: NoiseRun,
     bank: BankRun,
     tables: Vec<TableRun>,
+    metal: MetalRun,
     low_cut: Option<Svf>,
     active: bool,
 }
@@ -1396,7 +2136,12 @@ impl SynthKick {
                 Arc::from(Vec::new())
             }
         });
-        Self::build(spec, periods, sample_rate)
+        let metal = if spec.metal.level > 0.0 {
+            metal_tables(&spec.metal)
+        } else {
+            Vec::new()
+        };
+        Self::build(spec, periods, metal, sample_rate)
     }
 
     /// The same voice at another sample rate, silent, its tables shared rather than built again
@@ -1404,10 +2149,15 @@ impl SynthKick {
     #[must_use]
     pub fn at_rate(&self, sample_rate: f64) -> Self {
         let periods = std::array::from_fn(|i| Arc::clone(&self.tables[i].period));
-        Self::build(self.preset, periods, sample_rate)
+        Self::build(self.preset, periods, self.metal.tables.clone(), sample_rate)
     }
 
-    fn build(spec: SynthKickSpec, periods: [Arc<[f32]>; TABLES], sample_rate: f64) -> Self {
+    fn build(
+        spec: SynthKickSpec,
+        periods: [Arc<[f32]>; TABLES],
+        metal: Vec<Vec<MetalTable>>,
+        sample_rate: f64,
+    ) -> Self {
         let low_cut =
             (spec.low_cut_hz > 0.0).then(|| Svf::new(spec.low_cut_hz, FRAC_1_SQRT_2, sample_rate));
         let idle = NoiseRun::start(&spec.click, 0.0, spec.seed, sample_rate);
@@ -1444,6 +2194,7 @@ impl SynthKick {
                 .zip(periods)
                 .map(|(t, period)| TableRun::new(t, period, sample_rate))
                 .collect(),
+            metal: MetalRun::new(metal),
             low_cut,
             active: false,
         }
@@ -1471,6 +2222,26 @@ impl SynthKick {
             Controls::default().toward(&soft, 1.0 - v)
         };
         self.spec = controls.and(&struck).apply(&self.preset);
+        if self.preset.metal.level > 0.0 && self.preset.metal.reads_softer() {
+            // The metal's own readings carry the strike's balance, its tables' levels and decays
+            // with it; the velocity's controls would move them twice. The player's controls still
+            // reach them, and the strike's attack and tone the tables.
+            let mut at = self.preset;
+            at.metal = self.preset.metal.at_velocity(v);
+            for (t, (db, decay)) in at.tables.iter_mut().zip(self.preset.metal.tables_at(v)) {
+                t.level *= 10f64.powf(db / 20.0);
+                t.t60_s *= decay;
+                t.tail_s *= decay;
+            }
+            let read = Controls {
+                mix_db: [0.0; TABLES],
+                decay: [1.0; TABLES],
+                ..struck
+            };
+            let s = controls.and(&read).apply(&at);
+            self.spec.tables = s.tables;
+            self.spec.metal = controls.apply(&at).metal;
+        }
         let s = self.spec;
         let fs = self.sample_rate;
         let drop_fall = |seconds: f64| (-self.dt / seconds.max(1e-4)).exp();
@@ -1520,6 +2291,8 @@ impl SynthKick {
         for (run, table) in self.tables.iter_mut().zip(&s.tables) {
             run.start(table, v, fs);
         }
+        self.metal
+            .start(&s.metal, v, seed.wrapping_add(METAL_SEED), fs);
         if let Some(cut) = &mut self.low_cut {
             cut.clear();
         }
@@ -1607,9 +2380,12 @@ impl SynthKick {
             .zip(&self.spec.tables)
             .map(|(run, table)| run.tick(table, age, fs))
             .sum();
+        let mut out = body + second + partials + click + noise + bank + tables;
+        if self.metal.active {
+            out += v * self.metal.tick(age);
+        }
         self.age += 1;
 
-        let mut out = body + second + partials + click + noise + bank + tables;
         if let Some(cut) = &mut self.low_cut {
             out = cut.tick(out).1;
         }
@@ -1623,6 +2399,7 @@ impl SynthKick {
             .max(self.noise.loudness())
             .max(self.noise2.loudness())
             .max(self.bank.loudness())
+            .max(self.metal.loudness())
             .max(
                 self.tables
                     .iter()
@@ -1684,6 +2461,7 @@ impl SynthKick {
             run.lp.clear();
             run.level = 0.0;
         }
+        self.metal.active = false;
         if let Some(cut) = &mut self.low_cut {
             cut.clear();
         }
