@@ -56,6 +56,8 @@
 use std::f64::consts::{FRAC_1_SQRT_2, PI, TAU};
 use std::sync::Arc;
 
+use mxm_rng::Xorshift64Star;
+
 /// A section below this, and the mix below it, parks the voice at exact zeros.
 const PARK_LEVEL: f64 = 1e-7;
 /// The velocity every route is centred on (**chosen**: a patch is the middle strike).
@@ -476,7 +478,7 @@ pub fn bank_levels(x: &[f64], sample_rate: f64, at: &[usize]) -> Vec<Vec<f64>> {
 #[derive(Debug, Clone, Copy)]
 struct BandRun {
     filter: BandFilter,
-    white: White,
+    white: Xorshift64Star,
     centre: f64,
     /// What a gain of 1 reads, as `bank_levels` reads, every band playing (see `BankRun::new`).
     unit: f64,
@@ -490,7 +492,7 @@ impl Default for BandRun {
     fn default() -> Self {
         Self {
             filter: BandFilter::default(),
-            white: White::new(1),
+            white: white(1),
             centre: 0.0,
             unit: 0.0,
             gain: 0.0,
@@ -520,7 +522,7 @@ impl BankRun {
             let centre = (lo * hi).sqrt();
             *band = BandRun {
                 filter: BandFilter::new(centre, sample_rate),
-                white: White::new(0x00DD_BA11 + k as u64),
+                white: white(0x00DD_BA11 + k as u64),
                 centre,
                 unit: 1.0,
                 gain: 0.0,
@@ -538,7 +540,7 @@ impl BankRun {
         let mut sum = vec![0.0; settle + count];
         for band in &mut bands[..layout.len()] {
             for v in &mut sum {
-                *v += band.filter.tick(band.white.next());
+                *v += band.filter.tick(band.white.bipolar_f64());
             }
             band.filter.clear();
         }
@@ -569,7 +571,7 @@ impl BankRun {
         self.loudest = 0.0;
         for (k, band) in self.bands[..self.count].iter_mut().enumerate() {
             band.white =
-                White::new(seed.wrapping_add((k as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)));
+                white(seed.wrapping_add((k as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)));
             band.filter.clear();
             band.gain = 0.0;
             band.step = 0.0;
@@ -607,7 +609,7 @@ impl BankRun {
     fn tick(&mut self) -> f64 {
         let mut out = 0.0;
         for band in self.bands[..self.count].iter_mut().filter(|b| b.active) {
-            let n = band.white.next();
+            let n = band.white.bipolar_f64();
             out += band.gain * band.filter.tick(n);
             band.gain += band.step;
         }
@@ -1196,11 +1198,11 @@ fn band_tables(m: &Metal, tone: &BandTone) -> Vec<MetalTable> {
     (0..METAL_BANDS)
         .map(|b| {
             let (lo, hi) = m.edges(b);
-            let mut white = White::new(
+            let mut white = white(
                 tone.seed
                     .wrapping_add(METAL_SEED.wrapping_mul(b as u64 + 1)),
             );
-            let mut uniform = || 0.5 * (white.next() + 1.0);
+            let mut uniform = || 0.5 * (white.bipolar_f64() + 1.0);
             let mut lines: Vec<(f64, f64)> = Vec::new();
             for _ in 0..tone.partials[b].round().max(0.0) as usize {
                 let hz = lo * (hi / lo).powf(uniform());
@@ -1354,7 +1356,7 @@ struct MetalRun {
     tables: Vec<Vec<MetalTable>>,
     first: usize,
     bands: [MetalBandRun; METAL_BANDS],
-    noise: White,
+    noise: Xorshift64Star,
     level: f64,
     /// The tick's peak, its width and centre in samples.
     strike: f64,
@@ -1373,7 +1375,7 @@ impl MetalRun {
             tables,
             first: 0,
             bands: [MetalBandRun::default(); METAL_BANDS],
-            noise: White::new(1),
+            noise: white(1),
             level: 0.0,
             strike: 0.0,
             strike_w: 1.0,
@@ -1415,7 +1417,7 @@ impl MetalRun {
             ([(1.0 - w).max(0.0).sqrt(), w.min(1.0).sqrt()], second)
         };
         self.first = first;
-        self.noise = White::new(seed);
+        self.noise = white(seed);
         self.strike = m.strike;
         self.strike_w = (m.strike_s * sample_rate).max(1e-3);
         self.strike_at = 3.0 * self.strike_w;
@@ -1446,7 +1448,7 @@ impl MetalRun {
             let noise = &mut self.noise;
             let mut start_of = |table: &MetalTable| {
                 let starts = &table.starts;
-                let pick = (0.5 * (noise.next() + 1.0) * starts.len() as f64) as usize;
+                let pick = (0.5 * (noise.bipolar_f64() + 1.0) * starts.len() as f64) as usize;
                 starts
                     .get(pick.min(starts.len().saturating_sub(1)))
                     .map_or(0.0, |&s| f64::from(s))
@@ -1702,21 +1704,10 @@ impl Svf {
     }
 }
 
-/// xorshift64*, uniform in [−1, 1).
-#[derive(Debug, Clone, Copy)]
-struct White(u64);
-
-impl White {
-    fn new(seed: u64) -> Self {
-        Self(seed.max(1) ^ 0x9E37_79B9_7F4A_7C15)
-    }
-
-    fn next(&mut self) -> f64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        (self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 52) as f64 - 1.0
-    }
+/// The kick's white noise: `mxm-rng`'s xorshift64*, drawn uniform in [−1, 1). A zero seed is moved
+/// to one before the golden-ratio mix, the rule every stored seed was rendered with.
+fn white(seed: u64) -> Xorshift64Star {
+    Xorshift64Star::from_state(seed.max(1) ^ 0x9E37_79B9_7F4A_7C15)
 }
 
 /// A linear rise over `samples`, then held: the attack every section starts with.
@@ -1800,7 +1791,7 @@ impl Sine {
 struct NoiseRun {
     level: f64,
     filter: Svf,
-    white: White,
+    white: Xorshift64Star,
     env: f64,
     fall: f64,
     /// The second stage: its share, level and fall.
@@ -1815,7 +1806,7 @@ impl NoiseRun {
         Self {
             level: routed(spec.level, spec.vel_level, velocity) * velocity,
             filter: Svf::new(routed(spec.hz, spec.vel_hz, velocity), spec.q, sample_rate),
-            white: White::new(seed),
+            white: white(seed),
             env: 1.0,
             fall: fall(spec.t60_s, sample_rate),
             tail: spec.tail.clamp(0.0, 1.0),
@@ -1829,7 +1820,7 @@ impl NoiseRun {
         if self.level <= 0.0 {
             return 0.0;
         }
-        let n = self.white.next();
+        let n = self.white.bipolar_f64();
         let r = rise(age, self.attack_samples);
         let out = self.level * r * self.envelope() * self.filter.band(n);
         if r >= 1.0 {
