@@ -56,7 +56,7 @@
 use std::f64::consts::{FRAC_1_SQRT_2, PI, TAU};
 use std::sync::Arc;
 
-use mxm_rng::Xorshift64Star;
+use mxm_rng::{SplitMix64, Xorshift64Star};
 
 /// A section below this, and the mix below it, parks the voice at exact zeros.
 const PARK_LEVEL: f64 = 1e-7;
@@ -945,6 +945,81 @@ pub const TICK_CUT_Q: [f64; 2] = [0.541_196_100_146_197, 1.306_562_964_876_376_6
 /// The cut rings this long after the spike, s, and is then not run.
 const TICK_RING_S: f64 = 0.02;
 
+/// A sizzle cymbal's rattle (the owner, 2026-10-19: "high frequency sizzle that goes in and out",
+/// "sizzle or metallic rattle"): its rivets kicked loose again and again as the cymbal swings. Each
+/// kick lifts the top bands at once, by `jump_db` on average (`rattle_depth`; each kick drawn
+/// evenly between half and one and a half times it, as the takes' kicks differ), and the lift falls
+/// back exponentially over `relax_s`; the kicks come at random, `rate_hz` a second on average (a
+/// Poisson process, drawn anew each strike: a seed's one draw would kick every hit alike, and a
+/// rare rattle's long first wait would leave every hit of it without). The lift is taken about its mean, so the bands' curves still set
+/// their level. Read on Big Rusty's sizzle crash and ride, 4–16 kHz in 5 ms frames about a 1 s running
+/// median (2026-10-19): 0.3–6 kicks a second of 3–5 dB, the level scattering 0.6–2.3 dB, where a
+/// model without it scatters 0.3–0.5 and never kicks; the swings move together from 3.5 kHz up, and
+/// not below 2 kHz, where the cymbal's own modes beat apart. Off at a rate of 0.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rattle {
+    /// Kicks a second, on average.
+    pub rate_hz: f64,
+    /// A kick's mean lift where the depth is 1 (`RATTLE_UNIT_HZ`), dB.
+    pub jump_db: f64,
+    /// Its time constant falling back, s.
+    pub relax_s: f64,
+}
+
+impl Rattle {
+    pub const OFF: Self = Self {
+        rate_hz: 0.0,
+        jump_db: 0.0,
+        relax_s: 0.0,
+    };
+
+    /// Whether it sounds.
+    #[must_use]
+    pub fn is_on(&self) -> bool {
+        self.rate_hz > 0.0 && self.jump_db > 0.0 && self.relax_s > 0.0
+    }
+
+    /// `w` of the way from `self` to `to`: the rate and the lift straight, the time in octaves.
+    #[must_use]
+    pub fn toward(&self, to: &Self, w: f64) -> Self {
+        let relax = if self.relax_s > 0.0 && to.relax_s > 0.0 {
+            self.relax_s * (to.relax_s / self.relax_s).powf(w)
+        } else {
+            self.relax_s + w * (to.relax_s - self.relax_s)
+        };
+        Self {
+            rate_hz: self.rate_hz + w * (to.rate_hz - self.rate_hz),
+            jump_db: self.jump_db + w * (to.jump_db - self.jump_db),
+            relax_s: relax,
+        }
+    }
+}
+
+impl Default for Rattle {
+    fn default() -> Self {
+        Self::OFF
+    }
+}
+
+/// How deep the rattle swings a band against `Rattle::jump_db`, by the band's centre: nothing up to
+/// `RATTLE_FROM_HZ`, 1 at `RATTLE_UNIT_HZ`, and on up by octaves (0.4 at 4.3 kHz, 1.3 at 15 kHz on the
+/// default bands). Read on the same takes: the 4–8 kHz swing about 0.7 of the 8–16 kHz one, moving
+/// with it (correlation 0.4–0.8), the 16–22 kHz about 1.5–2 times; 2–4 kHz hardly with it (0.1–0.45).
+const RATTLE_FROM_HZ: f64 = 2_600.0;
+const RATTLE_UNIT_HZ: f64 = 10_000.0;
+/// A kick's rise, s: the takes' kicks rise over 5–15 ms; at once, a band's lift is a click.
+const RATTLE_RISE_S: f64 = 0.003;
+
+/// The rattle's depth in band `b` of `m` (`RATTLE_FROM_HZ`).
+fn rattle_depth(m: &Metal, b: usize) -> f64 {
+    let (lo, hi) = m.edges(b);
+    let centre = (lo * hi).sqrt();
+    if centre <= RATTLE_FROM_HZ {
+        return 0.0;
+    }
+    (centre / RATTLE_FROM_HZ).log2() / (RATTLE_UNIT_HZ / RATTLE_FROM_HZ).log2()
+}
+
 /// One band of the metal: its scattered partials, the noise between them, and its level over time.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MetalBand {
@@ -997,6 +1072,8 @@ pub struct MetalSofter {
     /// Held by reference: a patch is copied at every strike, and four kilobytes more in each copy
     /// overflowed a debug build's two-megabyte stack through the plugin's `process`.
     pub tone: Option<&'static MetalTone>,
+    /// Its rattle (`Rattle`): a soft hit kicks the rivets less often.
+    pub rattle: Rattle,
 }
 
 /// A reading's tone, as the hardest's is in `MetalBand` and `Metal`: each band's scattered
@@ -1044,6 +1121,7 @@ impl Default for MetalSofter {
             tables_db: [0.0; TABLES],
             tables_decay: [1.0; TABLES],
             tone: None,
+            rattle: Rattle::OFF,
         }
     }
 }
@@ -1077,6 +1155,8 @@ pub struct Metal {
     pub strike_s: f64,
     /// The softest strike's reading, then the middle's; the hardest's is the bands' own, at 1.
     pub softer: [MetalSofter; 2],
+    /// The hardest's rattle (`Rattle`); a softer reading has its own.
+    pub rattle: Rattle,
 }
 
 impl Default for Metal {
@@ -1094,6 +1174,7 @@ impl Default for Metal {
             strike: 0.0,
             strike_s: 3e-5,
             softer: [MetalSofter::default(); 2],
+            rattle: Rattle::OFF,
         }
     }
 }
@@ -1128,6 +1209,7 @@ impl Metal {
             }
         }
         m.strike = a.strike + w * (b.strike - a.strike);
+        m.rattle = a.rattle.toward(&b.rattle, w);
         m
     }
 
@@ -1176,6 +1258,7 @@ impl Metal {
             velocity: 1.0,
             curve_db: self.bands.map(|b| b.curve_db),
             strike: self.strike,
+            rattle: self.rattle,
             ..MetalSofter::default()
         })
     }
@@ -1483,6 +1566,85 @@ struct MetalRun {
     tick_gain: f64,
     tick_until: u64,
     active: bool,
+    rattle: RattleRun,
+}
+
+/// The rattle sounding (`Rattle`): the kicks' sum in dB, its rise, and each band's depth.
+#[derive(Debug, Clone)]
+struct RattleRun {
+    on: bool,
+    /// SplitMix64, whose every draw mixes every bit of its seed: the seeds here differ in a few
+    /// bits, and xorshift64*'s first draws from them kick in step.
+    draws: SplitMix64,
+    /// The age of the next kick, a kick's lift, and the rate they come at, a sample.
+    next: u64,
+    jump: f64,
+    rate: f64,
+    /// The kicks' sum, dB: each lifts it by `jump` and it falls by `fall` a sample, its mean `mean`.
+    sum: f64,
+    fall: f64,
+    mean: f64,
+    /// The sum risen (`RATTLE_RISE_S`), a one-pole's coefficient.
+    risen: f64,
+    rise: f64,
+    /// Each band's depth, as a gain's exponent: ln 10 / 20 × `rattle_depth`.
+    depth: [f64; METAL_BANDS],
+}
+
+impl Default for RattleRun {
+    fn default() -> Self {
+        Self {
+            on: false,
+            draws: SplitMix64::new(1),
+            next: u64::MAX,
+            jump: 0.0,
+            rate: 0.0,
+            sum: 0.0,
+            fall: 1.0,
+            mean: 0.0,
+            risen: 0.0,
+            rise: 0.0,
+            depth: [0.0; METAL_BANDS],
+        }
+    }
+}
+
+impl RattleRun {
+    fn start(&mut self, m: &Metal, seed: u64, sample_rate: f64) {
+        let r = &m.rattle;
+        self.on = r.is_on();
+        if !self.on {
+            return;
+        }
+        self.draws = SplitMix64::new(seed);
+        self.jump = r.jump_db;
+        self.rate = r.rate_hz / sample_rate;
+        self.fall = (-1.0 / (r.relax_s * sample_rate)).exp();
+        // Shot noise's mean: rate × lift × time constant. Started there, as if it had rung on.
+        self.mean = r.rate_hz * r.jump_db * r.relax_s;
+        self.sum = self.mean;
+        self.risen = self.mean;
+        self.rise = 1.0 - (-1.0 / (RATTLE_RISE_S * sample_rate)).exp();
+        self.depth = std::array::from_fn(|b| rattle_depth(m, b) * std::f64::consts::LN_10 / 20.0);
+        self.next = self.after(0);
+    }
+
+    /// The age of the kick after one at `age`: an exponential wait at the rate.
+    fn after(&mut self, age: u64) -> u64 {
+        let u = 1.0 - self.draws.unit_f64();
+        age.saturating_add((-u.ln() / self.rate).ceil().max(1.0) as u64)
+    }
+
+    /// Its lift now, about its mean, dB; and on a sample.
+    fn step(&mut self, age: u64) -> f64 {
+        if age >= self.next {
+            self.sum += self.jump * (0.5 + self.draws.unit_f64());
+            self.next = self.after(age);
+        }
+        self.sum *= self.fall;
+        self.risen += self.rise * (self.sum - self.risen);
+        self.risen - self.mean
+    }
 }
 
 impl MetalRun {
@@ -1500,6 +1662,7 @@ impl MetalRun {
             tick_gain: 0.0,
             tick_until: 0,
             active: false,
+            rattle: RattleRun::default(),
         }
     }
 
@@ -1513,7 +1676,9 @@ impl MetalRun {
         }
     }
 
-    fn start(&mut self, m: &Metal, v: f64, seed: u64, sample_rate: f64) {
+    /// `strike` counts the voice's strikes: the rattle's kicks fall anew each one, as a cymbal's
+    /// rivets do, where the rest of the metal plays its seed's.
+    fn start(&mut self, m: &Metal, v: f64, seed: u64, strike: u64, sample_rate: f64) {
         self.level = m.level;
         self.active = m.level > 0.0 && self.tables.first().is_some_and(|t| !t.is_empty());
         if !self.active {
@@ -1592,6 +1757,16 @@ impl MetalRun {
             run.advance(0);
             run.env = gains[0];
         }
+        // Its own settings in its seed too: the kit's patches share one seed, and their first
+        // strikes would kick in step, a rare rattle's first wait as long in all of them.
+        let r = &m.rattle;
+        let rattle_seed = seed
+            .wrapping_add(RATTLE_SEED)
+            .wrapping_add(strike.wrapping_mul(STRIKE_SEED))
+            ^ r.rate_hz.to_bits()
+            ^ r.jump_db.to_bits().rotate_left(21)
+            ^ r.relax_s.to_bits().rotate_left(42);
+        self.rattle.start(m, rattle_seed, sample_rate);
     }
 
     fn tick(&mut self, age: u64) -> f64 {
@@ -1604,6 +1779,11 @@ impl MetalRun {
             let cut = self.tick_cut.iter_mut().fold(pulse, |v, s| s.high(v));
             out += self.strike * self.tick_gain * cut;
         }
+        let lift = if self.rattle.on {
+            self.rattle.step(age)
+        } else {
+            0.0
+        };
         let first = &self.tables[self.first];
         for (b, (run, table)) in self.bands.iter_mut().zip(first).enumerate() {
             let mut ring = Self::read(&table.samples, &mut run.at, run.step);
@@ -1611,6 +1791,9 @@ impl MetalRun {
                 let second = &self.tables[run.second][b].samples;
                 ring = run.mix[0] * ring
                     + run.mix[1] * Self::read(second, &mut run.at_second, run.step);
+            }
+            if self.rattle.on && self.rattle.depth[b] > 0.0 {
+                ring *= (lift * self.rattle.depth[b]).exp();
             }
             out += run.env * ring;
             run.advance(age);
@@ -2196,6 +2379,8 @@ const NOISE_SEED: u64 = 0x5851_F42D_4C95_7F2D;
 const NOISE2_SEED: u64 = 0x2545_F491_4F6C_DD1D;
 const BANK_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 const METAL_SEED: u64 = 0x94D0_49BB_1331_11EB;
+/// The metal's rattle's, from the metal's.
+const RATTLE_SEED: u64 = 0xBF58_476D_1CE4_E5B9;
 /// How far each strike moves the seed with `fresh_noise`: an odd constant, so no two strikes of the
 /// first 2^64 share one.
 const STRIKE_SEED: u64 = 0xD1B5_4A32_D192_ED03;
@@ -2439,8 +2624,13 @@ impl SynthKick {
                 run.choose(sets, w);
             }
         }
-        self.metal
-            .start(&self.spec.metal, v, seed.wrapping_add(METAL_SEED), fs);
+        self.metal.start(
+            &self.spec.metal,
+            v,
+            seed.wrapping_add(METAL_SEED),
+            self.strikes,
+            fs,
+        );
         if let Some(cut) = &mut self.low_cut {
             cut.clear();
         }
