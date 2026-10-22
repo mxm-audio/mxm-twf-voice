@@ -2463,6 +2463,30 @@ impl SynthKick {
         )
     }
 
+    /// The voice under `spec`, silent, this voice's metal tables shared rather than built again:
+    /// `spec`'s metal must hold this voice's tones, edges and seed (its levels, curves and tick may
+    /// differ), and its drum tables are built from `spec`. A patch's parts are rendered alone this way
+    /// offline (the synth fit's `stems` and `solve`), each without the metal's transforms. Allocates:
+    /// not on the audio thread.
+    #[must_use]
+    pub fn sharing_metal(&self, spec: SynthKickSpec) -> Self {
+        let periods = spec.tables.map(|t| {
+            if t.level > 0.0 {
+                Arc::from(table_period(&t))
+            } else {
+                Arc::from(Vec::new())
+            }
+        });
+        let readings = std::array::from_fn(|n| table_readings(&spec, n));
+        Self::build(
+            spec,
+            periods,
+            readings,
+            self.metal.tables.clone(),
+            self.sample_rate,
+        )
+    }
+
     fn build(
         spec: SynthKickSpec,
         periods: [Arc<[f32]>; TABLES],
