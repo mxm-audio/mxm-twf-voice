@@ -2427,6 +2427,11 @@ pub struct SynthKick {
     metal: MetalRun,
     low_cut: Option<Svf>,
     active: bool,
+    /// The end of the longest attack, samples: set at each strike, which every section's attack
+    /// is; the voice parks only past it.
+    attacks: f64,
+    /// Whether any partial sounds this strike: none, and their sum, all zeros, is not worked out.
+    partials_sounding: bool,
 }
 
 impl SynthKick {
@@ -2536,6 +2541,8 @@ impl SynthKick {
             metal: MetalRun::new(metal),
             low_cut,
             active: false,
+            attacks: 0.0,
+            partials_sounding: false,
         }
     }
 
@@ -2658,6 +2665,29 @@ impl SynthKick {
         if let Some(cut) = &mut self.low_cut {
             cut.clear();
         }
+        self.attacks = [
+            self.spec.body.attack_s,
+            self.spec.second.attack_s,
+            self.spec.partials.attack_s,
+            self.spec.noise.attack_s,
+            self.spec.noise2.attack_s,
+            self.spec.bank.rises(),
+            self.spec
+                .tables
+                .iter()
+                .map(|t| t.attack_s)
+                .fold(0.0, f64::max),
+            self.spec
+                .partials
+                .partials
+                .iter()
+                .map(|p| p.attack_s)
+                .fold(0.0, f64::max),
+        ]
+        .iter()
+        .fold(0.0f64, |m, a| m.max(*a))
+            * self.sample_rate;
+        self.partials_sounding = self.partials.iter().any(|p| p.level > 0.0);
         self.active = true;
     }
 
@@ -2714,15 +2744,19 @@ impl SynthKick {
         let second = v * second_attack * self.second.tick(second_pitch, dt, age);
         self.second_drop_env *= self.second_drop_fall;
 
-        let partial_attack = rise(age, self.spec.partials.attack_s * self.sample_rate);
-        let partial_pitch = 1.0 + self.spec.partials.drop * self.partial_drop_env;
-        let partials: f64 = self
-            .partials
-            .iter_mut()
-            .map(|p| p.tick(partial_pitch, dt, age))
-            .sum::<f64>()
-            * v
-            * partial_attack;
+        // A partial that does not sound gives zero: none sounding, their sum is zero, not summed.
+        let partials: f64 = if self.partials_sounding {
+            let partial_attack = rise(age, self.spec.partials.attack_s * self.sample_rate);
+            let partial_pitch = 1.0 + self.spec.partials.drop * self.partial_drop_env;
+            self.partials
+                .iter_mut()
+                .map(|p| p.tick(partial_pitch, dt, age))
+                .sum::<f64>()
+                * v
+                * partial_attack
+        } else {
+            0.0
+        };
         self.partial_drop_env *= self.partial_drop_fall;
 
         let click = self.click.tick(age);
@@ -2753,8 +2787,19 @@ impl SynthKick {
         }
         let out = self.spec.output_gain * out;
 
-        let loudest = self
-            .body_loudness()
+        // Parked once every section has faded and the attacks are over; the sections' loudness is
+        // read only once the output is that quiet.
+        if out.abs() < PARK_LEVEL && (age as f64) > self.attacks && self.loudest() * v < PARK_LEVEL
+        {
+            self.active = false;
+            return 0.0;
+        }
+        out as f32
+    }
+
+    /// The loudest section, as its own envelope reads it.
+    fn loudest(&self) -> f64 {
+        self.body_loudness()
             .max(self.second.loudness())
             .max(self.partials.iter().map(Sine::loudness).fold(0.0, f64::max))
             .max(self.click.loudness())
@@ -2767,35 +2812,7 @@ impl SynthKick {
                     .iter()
                     .map(TableRun::loudness)
                     .fold(0.0, f64::max),
-            );
-        let attacks = [
-            self.spec.body.attack_s,
-            self.spec.second.attack_s,
-            self.spec.partials.attack_s,
-            self.spec.noise.attack_s,
-            self.spec.noise2.attack_s,
-            self.spec.bank.rises(),
-            self.spec
-                .tables
-                .iter()
-                .map(|t| t.attack_s)
-                .fold(0.0, f64::max),
-            self.spec
-                .partials
-                .partials
-                .iter()
-                .map(|p| p.attack_s)
-                .fold(0.0, f64::max),
-        ]
-        .iter()
-        .fold(0.0f64, |m, a| m.max(*a))
-            * self.sample_rate;
-        // Parked once every section has faded and the attacks are over.
-        if loudest * v < PARK_LEVEL && out.abs() < PARK_LEVEL && (age as f64) > attacks {
-            self.active = false;
-            return 0.0;
-        }
-        out as f32
+            )
     }
 
     /// Fill `out`.
