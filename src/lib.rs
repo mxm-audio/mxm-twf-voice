@@ -58,8 +58,10 @@ use std::sync::Arc;
 
 use mxm_rng::{SplitMix64, Xorshift64Star};
 
-/// A section below this, and the mix below it, parks the voice at exact zeros.
-const PARK_LEVEL: f64 = 1e-7;
+/// Every section below this at the voice's output, and the output below it, parks the voice at
+/// exact zeros: −100 dBFS, under anything a mix plays back (the owner, 2026-10-25, of a voice
+/// still running at −140 dB, its ring long inaudible: "do them all").
+const PARK_LEVEL: f64 = 1e-5;
 /// The velocity every route is centred on (**chosen**: a patch is the middle strike).
 const ROUTE_CENTRE: f64 = 0.5;
 /// Partials the voice holds: a recorded kick's lines run to twenty-odd (Virtuosity's hard hit, 22).
@@ -2787,9 +2789,11 @@ impl SynthKick {
         }
         let out = self.spec.output_gain * out;
 
-        // Parked once every section has faded and the attacks are over; the sections' loudness is
-        // read only once the output is that quiet.
-        if out.abs() < PARK_LEVEL && (age as f64) > self.attacks && self.loudest() * v < PARK_LEVEL
+        // Parked once every section has faded and the attacks are over; the sections' loudness,
+        // at the output, is read only once the output is that quiet.
+        if out.abs() < PARK_LEVEL
+            && (age as f64) > self.attacks
+            && self.loudest() * v * self.spec.output_gain.abs() < PARK_LEVEL
         {
             self.active = false;
             return 0.0;
