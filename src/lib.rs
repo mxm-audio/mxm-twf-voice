@@ -425,6 +425,26 @@ impl BandFilter {
     fn tick(&mut self, x: f64) -> f64 {
         self.b.band(self.a.band(x))
     }
+}
+
+/// [`BandFilter`] in single precision, as the voice plays it.
+#[derive(Debug, Clone, Copy, Default)]
+struct BandFilter32 {
+    a: Svf32,
+    b: Svf32,
+}
+
+impl BandFilter32 {
+    fn new(centre_hz: f64, sample_rate: f64) -> Self {
+        Self {
+            a: Svf32::new(centre_hz, BANK_Q, sample_rate),
+            b: Svf32::new(centre_hz, BANK_Q, sample_rate),
+        }
+    }
+
+    fn tick(&mut self, x: f32) -> f32 {
+        self.b.band(self.a.band(x))
+    }
 
     fn clear(&mut self) {
         self.a.clear();
@@ -479,13 +499,13 @@ pub fn bank_levels(x: &[f64], sample_rate: f64, at: &[usize]) -> Vec<Vec<f64>> {
 /// between the centres and played the law 12 dB low (measured, `the_animated_filter_plays_its_law`).
 #[derive(Debug, Clone, Copy)]
 struct BandRun {
-    filter: BandFilter,
+    filter: BandFilter32,
     white: Xorshift64Star,
     centre: f64,
     /// What a gain of 1 reads, as `bank_levels` reads, every band playing (see `BankRun::new`).
     unit: f64,
-    gain: f64,
-    step: f64,
+    gain: f32,
+    step: f32,
     /// Run this block: its gain, or where it is going, above silence.
     active: bool,
 }
@@ -493,7 +513,7 @@ struct BandRun {
 impl Default for BandRun {
     fn default() -> Self {
         Self {
-            filter: BandFilter::default(),
+            filter: BandFilter32::default(),
             white: white(1),
             centre: 0.0,
             unit: 0.0,
@@ -509,7 +529,7 @@ impl Default for BandRun {
 struct BankRun {
     bands: [BandRun; MAX_BANDS],
     count: usize,
-    level: f64,
+    level: f32,
     /// The age, samples, the law is worked out again at.
     next_plan: u64,
     /// The strike's loudest band, as the law's first plan read it: what silence is measured against.
@@ -523,7 +543,7 @@ impl BankRun {
         for (k, (band, &(lo, hi))) in bands.iter_mut().zip(&layout).enumerate() {
             let centre = (lo * hi).sqrt();
             *band = BandRun {
-                filter: BandFilter::new(centre, sample_rate),
+                filter: BandFilter32::new(centre, sample_rate),
                 white: white(0x00DD_BA11 + k as u64),
                 centre,
                 unit: 1.0,
@@ -542,7 +562,7 @@ impl BankRun {
         let mut sum = vec![0.0; settle + count];
         for band in &mut bands[..layout.len()] {
             for v in &mut sum {
-                *v += band.filter.tick(band.white.bipolar_f64());
+                *v += f64::from(band.filter.tick(band.white.bipolar_f32()));
             }
             band.filter.clear();
         }
@@ -568,7 +588,7 @@ impl BankRun {
     }
 
     fn start(&mut self, spec: &Bank, velocity: f64, seed: u64) {
-        self.level = routed(spec.level, spec.vel_level, velocity) * velocity;
+        self.level = (routed(spec.level, spec.vel_level, velocity) * velocity) as f32;
         self.next_plan = 0;
         self.loudest = 0.0;
         for (k, band) in self.bands[..self.count].iter_mut().enumerate() {
@@ -599,19 +619,20 @@ impl BankRun {
         let floor = BANK_SILENT * self.loudest;
         for band in &mut self.bands[..self.count] {
             let target = 10f64.powf(spec.level_db(band.centre, t_next) / 20.0) / band.unit;
-            band.step = (target - band.gain) / span as f64;
-            band.active = target.max(band.gain) * band.unit > floor;
+            let gain = f64::from(band.gain);
+            band.step = ((target - gain) / span as f64) as f32;
+            band.active = target.max(gain) * band.unit > floor;
             if !band.active {
-                band.gain = target;
+                band.gain = target as f32;
                 band.step = 0.0;
             }
         }
     }
 
-    fn tick(&mut self) -> f64 {
+    fn tick(&mut self) -> f32 {
         let mut out = 0.0;
         for band in self.bands[..self.count].iter_mut().filter(|b| b.active) {
-            let n = band.white.bipolar_f64();
+            let n = band.white.bipolar_f32();
             out += band.gain * band.filter.tick(n);
             band.gain += band.step;
         }
@@ -619,10 +640,10 @@ impl BankRun {
     }
 
     fn loudness(&self) -> f64 {
-        self.level
+        f64::from(self.level)
             * self.bands[..self.count]
                 .iter()
-                .map(|b| b.gain * b.unit)
+                .map(|b| f64::from(b.gain) * b.unit)
                 .fold(0.0, f64::max)
     }
 }
@@ -742,20 +763,26 @@ struct TableRun {
     readings: Vec<Arc<[f32]>>,
     /// The periods playing, 0 the hardest's and `i + 1` reading `i`'s, and their gains.
     playing: [usize; 2],
-    mix: [f64; 2],
+    mix: [f32; 2],
     /// The period's own frequency, `hz·step`.
     base: f64,
     phase: f64,
-    level: f64,
+    level: f32,
     drop_env: f64,
     drop_fall: f64,
     drop2_env: f64,
     drop2_fall: f64,
+    /// The two stages' levels and falls: double, as a long fall's step a sample is too near 1
+    /// for single.
     first: f64,
     first_fall: f64,
     second: f64,
     second_fall: f64,
-    lp: Svf,
+    lp: Svf32,
+    /// The level at the strike, as a share of the attack's (`Table::swell`), and the attack,
+    /// samples: both set at the strike.
+    swell: f32,
+    attack: f32,
 }
 
 impl TableRun {
@@ -776,7 +803,9 @@ impl TableRun {
             first_fall: 0.0,
             second: 0.0,
             second_fall: 0.0,
-            lp: Svf::new(spec.lp_from_hz, spec.q, sample_rate),
+            lp: Svf32::new(spec.lp_from_hz, spec.q, sample_rate),
+            swell: 0.0,
+            attack: 1.0,
         }
     }
 
@@ -784,7 +813,7 @@ impl TableRun {
         self.level = if self.period.is_empty() {
             0.0
         } else {
-            routed(spec.level, spec.vel_level, velocity) * velocity
+            (routed(spec.level, spec.vel_level, velocity) * velocity) as f32
         };
         self.phase = 0.0;
         self.playing = [0; 2];
@@ -799,10 +828,12 @@ impl TableRun {
         self.first_fall = fall(spec.t60_s, sample_rate);
         self.second = spec.tail.clamp(0.0, 1.0);
         self.second_fall = fall(spec.tail_s, sample_rate);
-        self.lp = Svf::new(spec.lp_from_hz, spec.q, sample_rate);
+        self.lp = Svf32::new(spec.lp_from_hz, spec.q, sample_rate);
+        self.swell = spec.swell.clamp(0.0, 1.0) as f32;
+        self.attack = (spec.attack_s * sample_rate) as f32;
     }
 
-    fn tick(&mut self, spec: &Table, age: u64, sample_rate: f64) -> f64 {
+    fn tick(&mut self, spec: &Table, age: u64, sample_rate: f64) -> f32 {
         if self.level <= 0.0 {
             return 0.0;
         }
@@ -816,9 +847,9 @@ impl TableRun {
         }
         let at = self.phase * TABLE_LEN as f64;
         let i = at as usize % TABLE_LEN;
-        let frac = at - at.floor();
+        let frac = (at - at.floor()) as f32;
         let read = |period: &[f32]| {
-            let (a, b) = (f64::from(period[i]), f64::from(period[(i + 1) % TABLE_LEN]));
+            let (a, b) = (period[i], period[(i + 1) % TABLE_LEN]);
             a + frac * (b - a)
         };
         let wave = if self.mix[1] > 0.0 {
@@ -831,16 +862,15 @@ impl TableRun {
         self.phase = (self.phase + self.base * pitch / sample_rate).fract();
         self.drop_env *= self.drop_fall;
         self.drop2_env *= self.drop2_fall;
-        let swell = spec.swell.clamp(0.0, 1.0);
-        let env = (swell + (1.0 - swell) * rise(age, spec.attack_s * sample_rate))
-            * (self.first + self.second);
+        let env = (self.swell + (1.0 - self.swell) * rise(age, self.attack))
+            * (self.first + self.second) as f32;
         self.first *= self.first_fall;
         self.second *= self.second_fall;
         self.lp.low(self.level * env * wave)
     }
 
     fn loudness(&self) -> f64 {
-        self.level * (self.first + self.second)
+        f64::from(self.level) * (self.first + self.second)
     }
 
     /// A set's period: 0 the hardest's, `i + 1` reading `i`'s, the hardest's where it has none.
@@ -867,7 +897,7 @@ impl TableRun {
             self.mix = [1.0, 0.0];
         } else {
             self.playing = [first, second];
-            self.mix = [1.0 - w.min(1.0), w.min(1.0)];
+            self.mix = [(1.0 - w.min(1.0)) as f32, w.min(1.0) as f32];
         }
     }
 }
@@ -1517,7 +1547,8 @@ struct MetalBandRun {
     /// both tables' gains; the second's 0, it is not played.
     second: usize,
     at_second: f64,
-    mix: [f64; 2],
+    mix: [f32; 2],
+    /// The level curve: double, as a long fall's step a sample is too near 1 for single.
     env: f64,
     mult: f64,
     knot: usize,
@@ -1558,14 +1589,14 @@ struct MetalRun {
     first: usize,
     bands: [MetalBandRun; METAL_BANDS],
     noise: Xorshift64Star,
-    level: f64,
+    level: f32,
     /// The tick's peak, its width and centre in samples.
-    strike: f64,
+    strike: f32,
     strike_w: f64,
     strike_at: f64,
     /// The tick's low cut, the gain that restores its peak, and the age it stops ringing at.
-    tick_cut: [Svf; 2],
-    tick_gain: f64,
+    tick_cut: [Svf32; 2],
+    tick_gain: f32,
     tick_until: u64,
     active: bool,
     rattle: RattleRun,
@@ -1583,6 +1614,7 @@ struct RattleRun {
     jump: f64,
     rate: f64,
     /// The kicks' sum, dB: each lifts it by `jump` and it falls by `fall` a sample, its mean `mean`.
+    /// Double, as a long fall's step a sample is too near 1 for single.
     sum: f64,
     fall: f64,
     mean: f64,
@@ -1590,7 +1622,7 @@ struct RattleRun {
     risen: f64,
     rise: f64,
     /// Each band's depth, as a gain's exponent: ln 10 / 20 × `rattle_depth`.
-    depth: [f64; METAL_BANDS],
+    depth: [f32; METAL_BANDS],
 }
 
 impl Default for RattleRun {
@@ -1627,7 +1659,8 @@ impl RattleRun {
         self.sum = self.mean;
         self.risen = self.mean;
         self.rise = 1.0 - (-1.0 / (RATTLE_RISE_S * sample_rate)).exp();
-        self.depth = std::array::from_fn(|b| rattle_depth(m, b) * std::f64::consts::LN_10 / 20.0);
+        self.depth =
+            std::array::from_fn(|b| (rattle_depth(m, b) * std::f64::consts::LN_10 / 20.0) as f32);
         self.next = self.after(0);
     }
 
@@ -1638,14 +1671,14 @@ impl RattleRun {
     }
 
     /// Its lift now, about its mean, dB; and on a sample.
-    fn step(&mut self, age: u64) -> f64 {
+    fn step(&mut self, age: u64) -> f32 {
         if age >= self.next {
             self.sum += self.jump * (0.5 + self.draws.unit_f64());
             self.next = self.after(age);
         }
         self.sum *= self.fall;
         self.risen += self.rise * (self.sum - self.risen);
-        self.risen - self.mean
+        (self.risen - self.mean) as f32
     }
 }
 
@@ -1660,7 +1693,7 @@ impl MetalRun {
             strike: 0.0,
             strike_w: 1.0,
             strike_at: 0.0,
-            tick_cut: [Svf::default(); 2],
+            tick_cut: [Svf32::default(); 2],
             tick_gain: 0.0,
             tick_until: 0,
             active: false,
@@ -1669,8 +1702,8 @@ impl MetalRun {
     }
 
     /// The tick's Gaussian at `age`, before its cut.
-    fn pulse(&self, age: u64) -> f64 {
-        let from_tick = (age as f64 - self.strike_at) / self.strike_w;
+    fn pulse(&self, age: u64) -> f32 {
+        let from_tick = ((age as f64 - self.strike_at) / self.strike_w) as f32;
         if from_tick < 3.0 {
             (-0.5 * from_tick * from_tick).exp()
         } else {
@@ -1681,7 +1714,7 @@ impl MetalRun {
     /// `strike` counts the voice's strikes: the rattle's kicks fall anew each one, as a cymbal's
     /// rivets do, where the rest of the metal plays its seed's.
     fn start(&mut self, m: &Metal, v: f64, seed: u64, strike: u64, sample_rate: f64) {
-        self.level = m.level;
+        self.level = m.level as f32;
         self.active = m.level > 0.0 && self.tables.first().is_some_and(|t| !t.is_empty());
         if !self.active {
             return;
@@ -1701,10 +1734,10 @@ impl MetalRun {
         };
         self.first = first;
         self.noise = white(seed);
-        self.strike = m.strike;
+        self.strike = m.strike as f32;
         self.strike_w = (m.strike_s * sample_rate).max(1e-3);
         self.strike_at = 3.0 * self.strike_w;
-        self.tick_cut = TICK_CUT_Q.map(|q| Svf::new(TICK_CUT_HZ, q, sample_rate));
+        self.tick_cut = TICK_CUT_Q.map(|q| Svf32::new(TICK_CUT_HZ, q, sample_rate));
         // The cut lowers the spike's peak: scale it back to the peak read.
         let mut probe = self.tick_cut;
         let spike = (self.strike_at + 3.0 * self.strike_w).ceil() as u64 + 2;
@@ -1715,7 +1748,7 @@ impl MetalRun {
                     .fold(self.pulse(age), |v, s| s.high(v))
                     .abs()
             })
-            .fold(0.0f64, f64::max);
+            .fold(0.0f32, f32::max);
         self.tick_gain = if top > 0.0 { 1.0 / top } else { 0.0 };
         self.tick_until = spike + (TICK_RING_S * sample_rate) as u64;
         for (b, run) in self.bands.iter_mut().enumerate() {
@@ -1747,7 +1780,7 @@ impl MetalRun {
                 step: m.rate * METAL_LEN as f64 / (metal_period_s(b) * sample_rate),
                 second,
                 at_second,
-                mix,
+                mix: mix.map(|g| g as f32),
                 env: gains[0],
                 mult: 1.0,
                 knot: 0,
@@ -1771,7 +1804,7 @@ impl MetalRun {
         self.rattle.start(m, rattle_seed, sample_rate);
     }
 
-    fn tick(&mut self, age: u64) -> f64 {
+    fn tick(&mut self, age: u64) -> f32 {
         if !self.active {
             return 0.0;
         }
@@ -1797,22 +1830,22 @@ impl MetalRun {
             if self.rattle.on && self.rattle.depth[b] > 0.0 {
                 ring *= (lift * self.rattle.depth[b]).exp();
             }
-            out += run.env * ring;
+            out += run.env as f32 * ring;
             run.advance(age);
         }
         self.level * out
     }
 
     /// A table's sample at `at`, which moves on by `step` round it; 0 for an empty table.
-    fn read(table: &[f32], at: &mut f64, step: f64) -> f64 {
+    fn read(table: &[f32], at: &mut f64, step: f64) -> f32 {
         if table.is_empty() {
             return 0.0;
         }
         // Four points, cubic (Catmull–Rom): a straight line between two leaves images of the high
         // partials that fold into the middle bands.
         let i = *at as usize;
-        let t = *at - i as f64;
-        let point = |k: usize| f64::from(table[(i + k + METAL_LEN - 1) % METAL_LEN]);
+        let t = (*at - i as f64) as f32;
+        let point = |k: usize| table[(i + k + METAL_LEN - 1) % METAL_LEN];
         let (p0, p1, p2, p3) = (point(0), point(1), point(2), point(3));
         *at += step;
         if *at >= METAL_LEN as f64 {
@@ -1828,7 +1861,7 @@ impl MetalRun {
         if !self.active {
             return 0.0;
         }
-        self.level * self.bands.iter().map(|b| b.env).fold(0.0, f64::max)
+        f64::from(self.level) * self.bands.iter().map(|b| b.env).fold(0.0, f64::max)
     }
 }
 
@@ -1978,14 +2011,55 @@ impl Svf {
     fn band(&mut self, v0: f64) -> f64 {
         self.k * self.tick(v0).0
     }
+}
+
+/// [`Svf`] in single precision, as the voice's samples run (2026-10-25): its coefficients worked
+/// out in double, then kept single. `Svf` stays double where a recording is read (`bank_levels`).
+#[derive(Debug, Clone, Copy, Default)]
+struct Svf32 {
+    k: f32,
+    a1: f32,
+    a2: f32,
+    a3: f32,
+    ic1: f32,
+    ic2: f32,
+}
+
+impl Svf32 {
+    fn new(centre_hz: f64, q: f64, sample_rate: f64) -> Self {
+        let s = Svf::new(centre_hz, q, sample_rate);
+        Self {
+            k: s.k as f32,
+            a1: s.a1 as f32,
+            a2: s.a2 as f32,
+            a3: s.a3 as f32,
+            ic1: 0.0,
+            ic2: 0.0,
+        }
+    }
+
+    /// The band output and the high-pass output for one sample.
+    fn tick(&mut self, v0: f32) -> (f32, f32) {
+        let v3 = v0 - self.ic2;
+        let v1 = self.a1 * self.ic1 + self.a2 * v3;
+        let v2 = self.ic2 + self.a2 * self.ic1 + self.a3 * v3;
+        self.ic1 = 2.0 * v1 - self.ic1;
+        self.ic2 = 2.0 * v2 - self.ic2;
+        (v1, v0 - self.k * v1 - v2)
+    }
+
+    /// Band-pass, unity at its centre.
+    fn band(&mut self, v0: f32) -> f32 {
+        self.k * self.tick(v0).0
+    }
 
     /// High-pass, unity above its corner.
-    fn high(&mut self, v0: f64) -> f64 {
+    fn high(&mut self, v0: f32) -> f32 {
         self.tick(v0).1
     }
 
     /// Low-pass, unity below its corner.
-    fn low(&mut self, v0: f64) -> f64 {
+    fn low(&mut self, v0: f32) -> f32 {
         let (band, high) = self.tick(v0);
         v0 - self.k * band - high
     }
@@ -2012,23 +2086,25 @@ fn white(seed: u64) -> Xorshift64Star {
 }
 
 /// A linear rise over `samples`, then held: the attack every section starts with.
-fn rise(age: u64, samples: f64) -> f64 {
-    ((age as f64 + 1.0) / samples.max(1.0)).min(1.0)
+fn rise(age: u64, samples: f32) -> f32 {
+    ((age as f32 + 1.0) / samples.max(1.0)).min(1.0)
 }
 
 /// A sine with a pitch drop and a decay in one or two stages: the second oscillator and each partial.
 #[derive(Debug, Clone, Copy, Default)]
 struct Sine {
-    level: f64,
+    level: f32,
     hz: f64,
+    /// The envelope's two stages: double, as a long fall's step a sample is too near 1 for single.
     env: f64,
     fall: f64,
     tail: f64,
     tail_env: f64,
     tail_fall: f64,
+    /// Radians, kept within a turn so a long ring's phase keeps its precision.
     phase: f64,
     /// Its own attack, samples (0: none of its own); the level holds until it is over.
-    attack_samples: f64,
+    attack_samples: f32,
 }
 
 impl Sine {
@@ -2047,7 +2123,7 @@ impl Sine {
     /// A partial's line at `level` and `hz`.
     fn line(level: f64, hz: f64, p: &Partial, sample_rate: f64) -> Self {
         Self {
-            level,
+            level: level as f32,
             hz,
             env: 1.0,
             fall: fall(p.t60_s, sample_rate),
@@ -2055,12 +2131,12 @@ impl Sine {
             tail_env: 1.0,
             tail_fall: fall(p.tail_s, sample_rate),
             phase: p.phase,
-            attack_samples: (p.attack_s * sample_rate).max(0.0),
+            attack_samples: (p.attack_s * sample_rate).max(0.0) as f32,
         }
     }
 
     /// One sample at pitch factor `1 + k·e^(−t/τ)`, `age` samples after the strike.
-    fn tick(&mut self, pitch: f64, dt: f64, age: u64) -> f64 {
+    fn tick(&mut self, pitch: f64, dt: f64, age: u64) -> f32 {
         if self.level <= 0.0 {
             return 0.0;
         }
@@ -2069,8 +2145,11 @@ impl Sine {
         } else {
             1.0
         };
-        let out = self.level * r * self.envelope() * self.phase.sin();
+        let out = self.level * r * self.envelope() * (self.phase as f32).sin();
         self.phase += TAU * self.hz * pitch * dt;
+        if self.phase >= TAU {
+            self.phase = self.phase.rem_euclid(TAU);
+        }
         if r >= 1.0 {
             self.env *= self.fall;
             self.tail_env *= self.tail_fall;
@@ -2078,50 +2157,51 @@ impl Sine {
         out
     }
 
-    fn envelope(&self) -> f64 {
-        (1.0 - self.tail) * self.env + self.tail * self.tail_env
+    fn envelope(&self) -> f32 {
+        ((1.0 - self.tail) * self.env + self.tail * self.tail_env) as f32
     }
 
     fn loudness(&self) -> f64 {
-        self.level * self.envelope()
+        f64::from(self.level * self.envelope())
     }
 }
 
 /// Band-passed noise with its envelope, running.
 #[derive(Debug, Clone, Copy)]
 struct NoiseRun {
-    level: f64,
-    filter: Svf,
+    level: f32,
+    filter: Svf32,
     white: Xorshift64Star,
+    /// The envelope's two stages, double as the sines' are.
     env: f64,
     fall: f64,
     /// The second stage: its share, level and fall.
     tail: f64,
     tail_env: f64,
     tail_fall: f64,
-    attack_samples: f64,
+    attack_samples: f32,
 }
 
 impl NoiseRun {
     fn start(spec: &Noise, velocity: f64, seed: u64, sample_rate: f64) -> Self {
         Self {
-            level: routed(spec.level, spec.vel_level, velocity) * velocity,
-            filter: Svf::new(routed(spec.hz, spec.vel_hz, velocity), spec.q, sample_rate),
+            level: (routed(spec.level, spec.vel_level, velocity) * velocity) as f32,
+            filter: Svf32::new(routed(spec.hz, spec.vel_hz, velocity), spec.q, sample_rate),
             white: white(seed),
             env: 1.0,
             fall: fall(spec.t60_s, sample_rate),
             tail: spec.tail.clamp(0.0, 1.0),
             tail_env: 1.0,
             tail_fall: fall(spec.tail_s, sample_rate),
-            attack_samples: (spec.attack_s * sample_rate).max(1.0),
+            attack_samples: (spec.attack_s * sample_rate).max(1.0) as f32,
         }
     }
 
-    fn tick(&mut self, age: u64) -> f64 {
+    fn tick(&mut self, age: u64) -> f32 {
         if self.level <= 0.0 {
             return 0.0;
         }
-        let n = self.white.bipolar_f64();
+        let n = self.white.bipolar_f32();
         let r = rise(age, self.attack_samples);
         let out = self.level * r * self.envelope() * self.filter.band(n);
         if r >= 1.0 {
@@ -2131,12 +2211,12 @@ impl NoiseRun {
         out
     }
 
-    fn envelope(&self) -> f64 {
-        (1.0 - self.tail) * self.env + self.tail * self.tail_env
+    fn envelope(&self) -> f32 {
+        ((1.0 - self.tail) * self.env + self.tail * self.tail_env) as f32
     }
 
     fn loudness(&self) -> f64 {
-        self.level * self.envelope()
+        f64::from(self.level * self.envelope())
     }
 }
 
@@ -2404,11 +2484,13 @@ pub struct SynthKick {
     /// Strikes since the voice was built: `fresh_noise` moves the seed by them.
     strikes: u64,
     // The body.
-    body_level: f64,
+    body_level: f32,
     body_drop: f64,
     body_drop_env: f64,
     body_drop_fall: f64,
+    /// Radians, kept within a turn.
     body_phase: f64,
+    /// The body's two stages: double, as the other envelopes are.
     body_first: f64,
     body_first_fall: f64,
     body_second: f64,
@@ -2427,7 +2509,7 @@ pub struct SynthKick {
     bank: BankRun,
     tables: Vec<TableRun>,
     metal: MetalRun,
-    low_cut: Option<Svf>,
+    low_cut: Option<Svf32>,
     active: bool,
     /// The end of the longest attack, samples: set at each strike, which every section's attack
     /// is; the voice parks only past it.
@@ -2501,8 +2583,8 @@ impl SynthKick {
         metal: Vec<Vec<MetalTable>>,
         sample_rate: f64,
     ) -> Self {
-        let low_cut =
-            (spec.low_cut_hz > 0.0).then(|| Svf::new(spec.low_cut_hz, FRAC_1_SQRT_2, sample_rate));
+        let low_cut = (spec.low_cut_hz > 0.0)
+            .then(|| Svf32::new(spec.low_cut_hz, FRAC_1_SQRT_2, sample_rate));
         let idle = NoiseRun::start(&spec.click, 0.0, spec.seed, sample_rate);
         Self {
             preset: spec,
@@ -2607,7 +2689,7 @@ impl SynthKick {
 
         let b = &self.spec.body;
         let decay = routed(1.0, b.vel_decay, v);
-        self.body_level = b.level;
+        self.body_level = b.level as f32;
         self.body_drop = routed(b.drop, b.vel_drop, v);
         self.body_drop_env = 1.0;
         self.body_drop_fall = drop_fall(b.drop_s);
@@ -2694,16 +2776,16 @@ impl SynthKick {
     }
 
     /// The body's next sample, after its drive.
-    fn body(&mut self) -> f64 {
+    fn body(&mut self) -> f32 {
         let b = &self.spec.body;
         if self.body_level <= 0.0 {
             return 0.0;
         }
         let hz = b.hz * (1.0 + self.body_drop * self.body_drop_env);
-        let sine = self.body_phase.sin();
+        let sine = (self.body_phase as f32).sin();
         let wave = if b.shape > 0.0 {
             // A triangle through the same zero crossings and peaks as the sine.
-            let p = self.body_phase.rem_euclid(TAU) / TAU;
+            let p = (self.body_phase.rem_euclid(TAU) / TAU) as f32;
             let tri = if p < 0.25 {
                 4.0 * p
             } else if p < 0.75 {
@@ -2711,49 +2793,57 @@ impl SynthKick {
             } else {
                 4.0 * p - 4.0
             };
-            sine + b.shape.clamp(0.0, 1.0) * (tri - sine)
+            sine + b.shape.clamp(0.0, 1.0) as f32 * (tri - sine)
         } else {
             sine
         };
-        let attack = rise(self.age, b.attack_s * self.sample_rate);
-        let x =
-            self.velocity * self.body_level * attack * (self.body_first + self.body_second) * wave;
+        let attack = rise(self.age, (b.attack_s * self.sample_rate) as f32);
+        let x = self.velocity as f32
+            * self.body_level
+            * attack
+            * (self.body_first + self.body_second) as f32
+            * wave;
         self.body_phase += TAU * hz * self.dt;
+        if self.body_phase >= TAU {
+            self.body_phase = self.body_phase.rem_euclid(TAU);
+        }
         self.body_drop_env *= self.body_drop_fall;
         self.body_first *= self.body_first_fall;
         self.body_second *= self.body_second_fall;
         if b.drive > 0.0 {
-            (b.drive * x).tanh() / b.drive
+            let drive = b.drive as f32;
+            (drive * x).tanh() / drive
         } else {
             x
         }
     }
 
     fn body_loudness(&self) -> f64 {
-        self.body_level * (self.body_first + self.body_second)
+        f64::from(self.body_level) * (self.body_first + self.body_second)
     }
 
-    /// One sample of the mix.
+    /// One sample of the mix, worked out in single precision (2026-10-25); its phases double.
     pub fn tick(&mut self) -> f32 {
         if !self.active {
             return 0.0;
         }
-        let (dt, age, v) = (self.dt, self.age, self.velocity);
+        let (dt, age) = (self.dt, self.age);
+        let v = self.velocity as f32;
         let body = self.body();
 
-        let second_attack = rise(age, self.spec.second.attack_s * self.sample_rate);
+        let second_attack = rise(age, (self.spec.second.attack_s * self.sample_rate) as f32);
         let second_pitch = 1.0 + self.spec.second.drop * self.second_drop_env;
         let second = v * second_attack * self.second.tick(second_pitch, dt, age);
         self.second_drop_env *= self.second_drop_fall;
 
         // A partial that does not sound gives zero: none sounding, their sum is zero, not summed.
-        let partials: f64 = if self.partials_sounding {
-            let partial_attack = rise(age, self.spec.partials.attack_s * self.sample_rate);
+        let partials: f32 = if self.partials_sounding {
+            let partial_attack = rise(age, (self.spec.partials.attack_s * self.sample_rate) as f32);
             let partial_pitch = 1.0 + self.spec.partials.drop * self.partial_drop_env;
             self.partials
                 .iter_mut()
                 .map(|p| p.tick(partial_pitch, dt, age))
-                .sum::<f64>()
+                .sum::<f32>()
                 * v
                 * partial_attack
         } else {
@@ -2772,7 +2862,7 @@ impl SynthKick {
             0.0
         };
         let fs = self.sample_rate;
-        let tables: f64 = self
+        let tables: f32 = self
             .tables
             .iter_mut()
             .zip(&self.spec.tables)
@@ -2787,18 +2877,18 @@ impl SynthKick {
         if let Some(cut) = &mut self.low_cut {
             out = cut.tick(out).1;
         }
-        let out = self.spec.output_gain * out;
+        let out = self.spec.output_gain as f32 * out;
 
         // Parked once every section has faded and the attacks are over; the sections' loudness,
         // at the output, is read only once the output is that quiet.
-        if out.abs() < PARK_LEVEL
+        if f64::from(out.abs()) < PARK_LEVEL
             && (age as f64) > self.attacks
-            && self.loudest() * v * self.spec.output_gain.abs() < PARK_LEVEL
+            && self.loudest() * f64::from(v) * self.spec.output_gain.abs() < PARK_LEVEL
         {
             self.active = false;
             return 0.0;
         }
-        out as f32
+        out
     }
 
     /// The loudest section, as its own envelope reads it.
