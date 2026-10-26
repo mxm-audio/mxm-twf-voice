@@ -1581,6 +1581,55 @@ impl MetalBandRun {
     }
 }
 
+/// The metal's bands as lanes: fourteen, padded to whole vectors of four.
+const METAL_LANES: usize = 16;
+const _: () = assert!(METAL_BANDS <= METAL_LANES);
+
+/// One sample's reading of each band's table, a band a lane (`MetalRun::tick`): its four points and
+/// where between the middle two it reads. A lane no table filled reads 0.
+#[derive(Debug, Clone, Copy, Default)]
+struct MetalPoints {
+    points: [[f32; METAL_LANES]; 4],
+    t: [f32; METAL_LANES],
+}
+
+impl MetalPoints {
+    /// Band `b`'s points at `at`, which moves on by `step` round the table; an empty table leaves
+    /// its lane at 0 and its place where it is.
+    fn take(&mut self, b: usize, table: &[f32], at: &mut f64, step: f64) {
+        // A table is empty or whole: as whole, its points need no check.
+        let Ok(table) = <&[f32; METAL_LEN]>::try_from(table) else {
+            return;
+        };
+        let i = *at as usize;
+        self.t[b] = (*at - i as f64) as f32;
+        for (k, points) in self.points.iter_mut().enumerate() {
+            points[b] = table[(i + k + METAL_LEN - 1) % METAL_LEN];
+        }
+        *at += step;
+        if *at >= METAL_LEN as f64 {
+            *at -= METAL_LEN as f64;
+        }
+    }
+
+    /// Each lane's sample: four points, cubic (Catmull–Rom), as a straight line between two leaves
+    /// images of the high partials that fold into the middle bands.
+    fn cubics(&self) -> [f32; METAL_LANES] {
+        let [p0, p1, p2, p3] = &self.points;
+        let mut out = [0.0; METAL_LANES];
+        for (l, out) in out.iter_mut().enumerate() {
+            let (p0, p1, p2, p3, t) = (p0[l], p1[l], p2[l], p3[l], self.t[l]);
+            *out = p1
+                + 0.5
+                    * t
+                    * (p2 - p0
+                        + t * (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3
+                            + t * (3.0 * (p1 - p2) + p3 - p0)));
+        }
+        out
+    }
+}
+
 /// The metal sounding. Its tables are shared, as the other tables are: a set for each reading's
 /// tone (`metal_tables`), and the one this strike plays first.
 #[derive(Debug, Clone)]
@@ -1819,13 +1868,35 @@ impl MetalRun {
         } else {
             0.0
         };
-        let first = &self.tables[self.first];
-        for (b, (run, table)) in self.bands.iter_mut().zip(first).enumerate() {
-            let mut ring = Self::read(&table.samples, &mut run.at, run.step);
+        // Every band's points first, then their cubics side by side, then the sum in band order:
+        // each term and the order they add in as a band at a time, bit for bit, the cubics, which
+        // do not depend on one another, several bands an instruction (2026-10-26).
+        let mut first = MetalPoints::default();
+        let mut second = MetalPoints::default();
+        let mut crossfades = false;
+        for (b, (run, table)) in self
+            .bands
+            .iter_mut()
+            .zip(&self.tables[self.first])
+            .enumerate()
+        {
+            first.take(b, &table.samples, &mut run.at, run.step);
             if run.mix[1] > 0.0 {
-                let second = &self.tables[run.second][b].samples;
-                ring = run.mix[0] * ring
-                    + run.mix[1] * Self::read(second, &mut run.at_second, run.step);
+                crossfades = true;
+                let table = &self.tables[run.second][b].samples;
+                second.take(b, table, &mut run.at_second, run.step);
+            }
+        }
+        let rings = first.cubics();
+        let seconds = if crossfades {
+            second.cubics()
+        } else {
+            [0.0; METAL_LANES]
+        };
+        for (b, run) in self.bands.iter_mut().enumerate() {
+            let mut ring = rings[b];
+            if run.mix[1] > 0.0 {
+                ring = run.mix[0] * ring + run.mix[1] * seconds[b];
             }
             if self.rattle.on && self.rattle.depth[b] > 0.0 {
                 ring *= (lift * self.rattle.depth[b]).exp();
@@ -1834,27 +1905,6 @@ impl MetalRun {
             run.advance(age);
         }
         self.level * out
-    }
-
-    /// A table's sample at `at`, which moves on by `step` round it; 0 for an empty table.
-    fn read(table: &[f32], at: &mut f64, step: f64) -> f32 {
-        if table.is_empty() {
-            return 0.0;
-        }
-        // Four points, cubic (Catmull–Rom): a straight line between two leaves images of the high
-        // partials that fold into the middle bands.
-        let i = *at as usize;
-        let t = (*at - i as f64) as f32;
-        let point = |k: usize| table[(i + k + METAL_LEN - 1) % METAL_LEN];
-        let (p0, p1, p2, p3) = (point(0), point(1), point(2), point(3));
-        *at += step;
-        if *at >= METAL_LEN as f64 {
-            *at -= METAL_LEN as f64;
-        }
-        p1 + 0.5
-            * t
-            * (p2 - p0
-                + t * (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3 + t * (3.0 * (p1 - p2) + p3 - p0)))
     }
 
     fn loudness(&self) -> f64 {
