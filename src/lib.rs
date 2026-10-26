@@ -307,14 +307,94 @@ impl Default for Bank {
     }
 }
 
-/// A broad band's level at `x` octaves from 500 Hz, `t` s into its course, dB.
-fn broad_db(b: &Broad, x: f64, t: f64) -> f64 {
-    b.level_db
-        + b.slope_db * x
-        + b.curve_db * x * x
-        + rise_db(t, b.rise_s)
-        + stages_db(t, b.t60_s, b.tail, b.tail_s)
-        + b.tilt_db * x * (1.0 - (-t / b.tilt_s.max(1e-4)).exp())
+/// A broad band's level at `x` octaves from 500 Hz, at the time `at` holds its terms for, dB.
+fn broad_db(b: &Broad, at: &BroadAt, x: f64) -> f64 {
+    b.level_db + b.slope_db * x + b.curve_db * x * x + at.rise + at.stages + b.tilt_db * x * at.tilt
+}
+
+/// A broad band's terms `t` s into its course, the same at every band.
+#[derive(Debug, Clone, Copy)]
+struct BroadAt {
+    rise: f64,
+    stages: f64,
+    /// How far its tilt has reached, 0 to 1.
+    tilt: f64,
+}
+
+impl BroadAt {
+    fn new(b: &Broad, t: f64) -> Self {
+        Self {
+            rise: rise_db(t, b.rise_s),
+            stages: stages_db(t, b.t60_s, b.tail, b.tail_s),
+            tilt: 1.0 - (-t / b.tilt_s.max(1e-4)).exp(),
+        }
+    }
+}
+
+/// A band as the law reads it: its centre, octaves from 500 Hz, and the contact's band it is in.
+#[derive(Debug, Clone, Copy, Default)]
+struct LawBand {
+    centre_hz: f64,
+    x: f64,
+    k: usize,
+}
+
+impl LawBand {
+    fn new(centre_hz: f64) -> Self {
+        Self {
+            centre_hz,
+            x: (centre_hz / 500.0).log2(),
+            // The contact at this band: its nearest band's (the bands are the law's own).
+            k: ((centre_hz / 20.0).log2() * 3.0)
+                .floor()
+                .clamp(0.0, (MAX_BANDS - 1) as f64) as usize,
+        }
+    }
+}
+
+/// The law at one time: every term no band changes, worked out once for all of them
+/// (`BankRun::plan`; 2026-10-26: each band worked them out again, most of the bank's cost).
+struct LawAt<'a> {
+    bank: &'a Bank,
+    t: f64,
+    contact_rise: f64,
+    broad: BroadAt,
+    /// Each ring's centre, Hz, its rise and its stages, dB; `None` off.
+    rings: [Option<(f64, f64, f64)>; RINGS],
+    /// The wires' band, once they have come in.
+    wires: Option<BroadAt>,
+}
+
+impl LawAt<'_> {
+    fn level_db(&self, band: &LawBand) -> f64 {
+        let (bank, t, x, k) = (self.bank, self.t, band.x, band.k);
+        let mut power = 0.0;
+        let c = &bank.contact;
+        if c.level_db[k] > BANK_OFF_DB {
+            let db = c.level_db[k] + self.contact_rise - 60.0 * t / c.t60_s[k].max(1e-4);
+            power += 10f64.powf(db / 10.0);
+        }
+        if bank.broad.level_db > BANK_OFF_DB {
+            power += 10f64.powf(broad_db(&bank.broad, &self.broad, x) / 10.0);
+        }
+        for (r, at) in bank.rings.iter().zip(&self.rings) {
+            let Some((centre, rise, stages)) = *at else {
+                continue;
+            };
+            let ratio = band.centre_hz / centre;
+            let shape = -10.0 * (1.0 + r.q * r.q * (ratio - 1.0 / ratio).powi(2)).log10();
+            let db = r.level_db + shape + rise + stages;
+            power += 10f64.powf(db / 10.0);
+        }
+        if let Some(at) = &self.wires {
+            power += 10f64.powf(broad_db(&bank.wires.band, at, x) / 10.0);
+        }
+        if power > 0.0 {
+            10.0 * power.log10()
+        } else {
+            BANK_OFF_DB
+        }
+    }
 }
 
 /// Two stages in power, dB: `(1 − a)·10^(−6t/T1) + a·10^(−6t/T2)`, each falling 60 dB in its T60.
@@ -338,40 +418,30 @@ impl Bank {
     /// The law: the level of the band centred on `centre_hz`, dB of its RMS, `t` s after the strike.
     #[must_use]
     pub fn level_db(&self, centre_hz: f64, t: f64) -> f64 {
+        self.at(t).level_db(&LawBand::new(centre_hz))
+    }
+
+    /// The law at `t` s after the strike, for any band.
+    fn at(&self, t: f64) -> LawAt<'_> {
         let t = t.max(0.0);
-        let x = (centre_hz / 500.0).log2();
-        let mut power = 0.0;
-        // The contact at this band: its nearest band's level and T60 (the bands are the law's own).
-        let k = ((centre_hz / 20.0).log2() * 3.0)
-            .floor()
-            .clamp(0.0, (MAX_BANDS - 1) as f64) as usize;
-        let c = &self.contact;
-        if c.level_db[k] > BANK_OFF_DB {
-            let db = c.level_db[k] + rise_db(t, c.rise_s) - 60.0 * t / c.t60_s[k].max(1e-4);
-            power += 10f64.powf(db / 10.0);
-        }
-        if self.broad.level_db > BANK_OFF_DB {
-            power += 10f64.powf(broad_db(&self.broad, x, t) / 10.0);
-        }
-        for r in &self.rings {
-            if r.level_db <= BANK_OFF_DB {
-                continue;
-            }
-            let centre = r.to_hz * (r.from_hz / r.to_hz).powf((-t / r.move_s.max(1e-4)).exp());
-            let ratio = centre_hz / centre;
-            let shape = -10.0 * (1.0 + r.q * r.q * (ratio - 1.0 / ratio).powi(2)).log10();
-            let db =
-                r.level_db + shape + rise_db(t, r.rise_s) + stages_db(t, r.t60_s, r.tail, r.tail_s);
-            power += 10f64.powf(db / 10.0);
-        }
         let w = &self.wires;
-        if w.band.level_db > BANK_OFF_DB && t >= w.delay_s {
-            power += 10f64.powf(broad_db(&w.band, x, t - w.delay_s) / 10.0);
-        }
-        if power > 0.0 {
-            10.0 * power.log10()
-        } else {
-            BANK_OFF_DB
+        LawAt {
+            bank: self,
+            t,
+            contact_rise: rise_db(t, self.contact.rise_s),
+            broad: BroadAt::new(&self.broad, t),
+            rings: std::array::from_fn(|i| {
+                let r = &self.rings[i];
+                (r.level_db > BANK_OFF_DB).then(|| {
+                    (
+                        r.to_hz * (r.from_hz / r.to_hz).powf((-t / r.move_s.max(1e-4)).exp()),
+                        rise_db(t, r.rise_s),
+                        stages_db(t, r.t60_s, r.tail, r.tail_s),
+                    )
+                })
+            }),
+            wires: (w.band.level_db > BANK_OFF_DB && t >= w.delay_s)
+                .then(|| BroadAt::new(&w.band, t - w.delay_s)),
         }
     }
 
@@ -445,10 +515,68 @@ impl BandFilter32 {
     fn tick(&mut self, x: f32) -> f32 {
         self.b.band(self.a.band(x))
     }
+}
+
+/// The bank's band filters as lanes, a band a lane: each band's two band-passes in cascade
+/// (`BandFilter32`), their coefficients and state side by side, so one loop runs several bands an
+/// instruction (`BankRun::tick`).
+#[derive(Debug, Clone, Copy, Default)]
+struct BankFilters {
+    stages: [SvfLanes; 2],
+}
+
+/// One `Svf32` a lane.
+#[derive(Debug, Clone, Copy, Default)]
+struct SvfLanes {
+    k: [f32; MAX_BANDS],
+    a1: [f32; MAX_BANDS],
+    a2: [f32; MAX_BANDS],
+    a3: [f32; MAX_BANDS],
+    ic1: [f32; MAX_BANDS],
+    ic2: [f32; MAX_BANDS],
+}
+
+impl BankFilters {
+    fn set(&mut self, b: usize, filter: BandFilter32) {
+        for (lanes, svf) in self.stages.iter_mut().zip([filter.a, filter.b]) {
+            lanes.k[b] = svf.k;
+            lanes.a1[b] = svf.a1;
+            lanes.a2[b] = svf.a2;
+            lanes.a3[b] = svf.a3;
+            lanes.ic1[b] = svf.ic1;
+            lanes.ic2[b] = svf.ic2;
+        }
+    }
+
+    /// Every lane's band output for its input, as `BandFilter32::tick` works it out; a lane whose
+    /// `playing` mask is clear keeps its state, as a filter not ticked does. The mask picks bits, so
+    /// the loop needs no branch.
+    #[allow(clippy::needless_range_loop)] // A lane indexes eight arrays alike.
+    fn tick(&mut self, x: &[f32; MAX_BANDS], playing: &[u32; MAX_BANDS]) -> [f32; MAX_BANDS] {
+        let pick = |new: f32, old: f32, mask: u32| {
+            f32::from_bits((new.to_bits() & mask) | (old.to_bits() & !mask))
+        };
+        let mut y = *x;
+        for s in &mut self.stages {
+            for l in 0..MAX_BANDS {
+                // `Svf32::tick`, then `band`.
+                let (v0, ic1, ic2) = (y[l], s.ic1[l], s.ic2[l]);
+                let v3 = v0 - ic2;
+                let v1 = s.a1[l] * ic1 + s.a2[l] * v3;
+                let v2 = ic2 + s.a2[l] * ic1 + s.a3[l] * v3;
+                s.ic1[l] = pick(2.0 * v1 - ic1, ic1, playing[l]);
+                s.ic2[l] = pick(2.0 * v2 - ic2, ic2, playing[l]);
+                y[l] = s.k[l] * v1;
+            }
+        }
+        y
+    }
 
     fn clear(&mut self) {
-        self.a.clear();
-        self.b.clear();
+        for s in &mut self.stages {
+            s.ic1 = [0.0; MAX_BANDS];
+            s.ic2 = [0.0; MAX_BANDS];
+        }
     }
 }
 
@@ -493,15 +621,14 @@ pub fn bank_levels(x: &[f64], sample_rate: f64, at: &[usize]) -> Vec<Vec<f64>> {
         .collect()
 }
 
-/// One band running: its own noise and filter, the level a gain of 1 reads, its gain eased toward
-/// the law's. Each band has its own noise: bands filtering one noise summed near opposite phase where
+/// One band running: its own noise and filter (a lane of `BankRun::filters`), the level a gain of 1
+/// reads, its gain eased toward the law's. Each band has its own noise: bands filtering one noise summed near opposite phase where
 /// they overlap (a two-stage band-pass turns from +180° to −180° across its band), cut notches
 /// between the centres and played the law 12 dB low (measured, `the_animated_filter_plays_its_law`).
 #[derive(Debug, Clone, Copy)]
 struct BandRun {
-    filter: BandFilter32,
     white: Xorshift64Star,
-    centre: f64,
+    law: LawBand,
     /// What a gain of 1 reads, as `bank_levels` reads, every band playing (see `BankRun::new`).
     unit: f64,
     gain: f32,
@@ -513,9 +640,8 @@ struct BandRun {
 impl Default for BandRun {
     fn default() -> Self {
         Self {
-            filter: BandFilter32::default(),
             white: white(1),
-            centre: 0.0,
+            law: LawBand::default(),
             unit: 0.0,
             gain: 0.0,
             step: 0.0,
@@ -528,6 +654,7 @@ impl Default for BandRun {
 #[derive(Debug, Clone, Copy)]
 struct BankRun {
     bands: [BandRun; MAX_BANDS],
+    filters: BankFilters,
     count: usize,
     level: f32,
     /// The age, samples, the law is worked out again at.
@@ -539,13 +666,14 @@ struct BankRun {
 impl BankRun {
     fn new(sample_rate: f64) -> Self {
         let mut bands = [BandRun::default(); MAX_BANDS];
+        let mut filters = BankFilters::default();
         let layout = bank_bands(sample_rate);
         for (k, (band, &(lo, hi))) in bands.iter_mut().zip(&layout).enumerate() {
             let centre = (lo * hi).sqrt();
+            filters.set(k, BandFilter32::new(centre, sample_rate));
             *band = BandRun {
-                filter: BandFilter32::new(centre, sample_rate),
                 white: white(0x00DD_BA11 + k as u64),
-                centre,
+                law: LawBand::new(centre),
                 unit: 1.0,
                 gain: 0.0,
                 step: 0.0,
@@ -561,14 +689,14 @@ impl BankRun {
         let count = (0.5 * sample_rate) as usize;
         let mut sum = vec![0.0; settle + count];
         for band in &mut bands[..layout.len()] {
+            let mut filter = BandFilter32::new(band.law.centre_hz, sample_rate);
             for v in &mut sum {
-                *v += f64::from(band.filter.tick(band.white.bipolar_f32()));
+                *v += f64::from(filter.tick(band.white.bipolar_f32()));
             }
-            band.filter.clear();
         }
         for band in &mut bands[..layout.len()] {
-            let mut f = BandFilter::new(band.centre, sample_rate);
-            let mut g = BandFilter::new(band.centre, sample_rate);
+            let mut f = BandFilter::new(band.law.centre_hz, sample_rate);
+            let mut g = BandFilter::new(band.law.centre_hz, sample_rate);
             let mut power = 0.0;
             for (i, &v) in sum.iter().enumerate() {
                 let y = g.tick(f.tick(v));
@@ -580,6 +708,7 @@ impl BankRun {
         }
         Self {
             bands,
+            filters,
             count: layout.len(),
             level: 0.0,
             next_plan: 0,
@@ -594,10 +723,10 @@ impl BankRun {
         for (k, band) in self.bands[..self.count].iter_mut().enumerate() {
             band.white =
                 white(seed.wrapping_add((k as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)));
-            band.filter.clear();
             band.gain = 0.0;
             band.step = 0.0;
         }
+        self.filters.clear();
     }
 
     /// The gains the law asks for `BANK_BLOCK` samples on from `t` s after the strike, eased toward.
@@ -610,15 +739,16 @@ impl BankRun {
         };
         self.next_plan = age + span;
         let t_next = t + span as f64 / sample_rate;
+        let law = spec.at(t_next);
         if age == 0 {
             self.loudest = self.bands[..self.count]
                 .iter()
-                .map(|b| 10f64.powf(spec.level_db(b.centre, t_next) / 20.0))
+                .map(|b| 10f64.powf(law.level_db(&b.law) / 20.0))
                 .fold(0.0, f64::max);
         }
         let floor = BANK_SILENT * self.loudest;
         for band in &mut self.bands[..self.count] {
-            let target = 10f64.powf(spec.level_db(band.centre, t_next) / 20.0) / band.unit;
+            let target = 10f64.powf(law.level_db(&band.law) / 20.0) / band.unit;
             let gain = f64::from(band.gain);
             band.step = ((target - gain) / span as f64) as f32;
             band.active = target.max(gain) * band.unit > floor;
@@ -630,11 +760,24 @@ impl BankRun {
     }
 
     fn tick(&mut self) -> f32 {
+        // Each band's noise first, then every band's filters side by side, then the sum in band
+        // order: each term and the order they add in as a band at a time, bit for bit
+        // (2026-10-26). A band the law has let go is not run: no noise drawn, its filters held.
+        let mut x = [0.0f32; MAX_BANDS];
+        let mut playing = [0u32; MAX_BANDS];
+        for (b, band) in self.bands[..self.count].iter_mut().enumerate() {
+            if band.active {
+                playing[b] = u32::MAX;
+                x[b] = band.white.bipolar_f32();
+            }
+        }
+        let y = self.filters.tick(&x, &playing);
         let mut out = 0.0;
-        for band in self.bands[..self.count].iter_mut().filter(|b| b.active) {
-            let n = band.white.bipolar_f32();
-            out += band.gain * band.filter.tick(n);
-            band.gain += band.step;
+        for (band, y) in self.bands[..self.count].iter_mut().zip(y) {
+            if band.active {
+                out += band.gain * y;
+                band.gain += band.step;
+            }
         }
         self.level * out
     }
@@ -2977,9 +3120,7 @@ impl SynthKick {
         self.click.filter.clear();
         self.noise.filter.clear();
         self.noise2.filter.clear();
-        for band in &mut self.bank.bands[..self.bank.count] {
-            band.filter.clear();
-        }
+        self.bank.filters.clear();
         for run in &mut self.tables {
             run.lp.clear();
             run.level = 0.0;
