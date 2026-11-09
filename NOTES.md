@@ -20,3 +20,14 @@ unchanged. The drums keep `synth_kick` as a module that re-exports this crate, s
 code changed. Fingerprint before the lift, every patch the drums ship struck at 1, 0.5 and 0.15 and
 once under moved controls, 2 s at 48 kHz each, FNV-1a over the samples' bits: the 57 synthesized
 patches' combined `e77aabdc2a3dcbfb`, repeated run to run, and after it the same.
+
+## `play_as`, the keyboard's first addition (2026-11-09)
+
+A strike reads everything from the patch but the tables' periods and their softer readings, which
+depend on the overtones and the grid, not on the pitch. So a keyboard's 32 voices can play any
+anchor at any key without building on the audio thread: each is a clone of an anchor's voice, and
+`play_as` hands it another anchor's periods (shared `Arc`s) and the patch moved to the key. Checked
+against the drums as the contract asks: all 57 patches' fingerprints identical before and after;
+their cost examples alternated over six rounds, three in each order, the total within 0.3 % and
+every case the same in each order (the one-slot case read 0.9 % first in a round and 1.0 %
+second, whichever binary it was).

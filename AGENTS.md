@@ -22,6 +22,8 @@ every drum: the plan's §2.
   `SynthKickSpec`, the general `Controls` and `SynthKick`. Its names are the drums' (it began as a
   synthesized kick); its module documentation says what each section is and where its law comes
   from.
+- `tests/play_as.rs`: a voice moved onto another's tables (`SynthKick::play_as`, a keyboard's)
+  plays as one built for the patch, and moving, striking and rendering allocate nothing.
 - Root: `Cargo.toml`, `Cargo.lock`, `LICENSE`, `NOTICE.md`, `TRADEMARKS.md`, `README.md`,
   `CONTRIBUTING.md`, `.github/`.
 
@@ -44,7 +46,9 @@ every drum: the plan's §2.
 - **Realtime shape**: tables and metal are built off the audio thread and shared (`Arc`); a
   strike copies no patch onto the stack (`Controls::apply_to`, the voice's own working copies: a
   patch with metal is about 11 kB and a voice 55 kB, and a host's audio thread may be small);
-  `strike` and `render` allocate nothing.
+  `strike` and `render` allocate nothing. A keyboard's voices are clones of its anchors' voices, built
+  off the audio thread, and `play_as` moves one onto another anchor's tables and a moved patch,
+  allocating and freeing nothing.
 - **Samples are `f32`, slow falls `f64`** (the owner, 2026-10-25): filters, table reads, noise,
   sines and sums in single precision; the patch, the strike's arithmetic, phases and tables'
   places, and every slow fall (envelope stages, the metal's level curves, the rattle's sum) in

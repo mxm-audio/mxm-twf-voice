@@ -2769,6 +2769,25 @@ impl SynthKick {
         )
     }
 
+    /// This voice made to play `preset` on `tables`' periods, silent until struck: a keyboard's
+    /// voices, each taking the anchor a note plays (ops' `plans/plan-mxm-twf.md` §5). `preset`'s
+    /// tables must hold `tables`' overtones and grids (their pitch, levels, falls and filters may
+    /// differ: a strike reads those from the patch); the periods and their softer readings are
+    /// shared, not copied, and the metal stays this voice's own. **Allocates nothing and frees
+    /// nothing** while `tables` lives, its readings fit this voice's and this voice's own periods
+    /// are held elsewhere too (a voice cloned from an anchor's; one built alone frees its own the
+    /// first time): the audio thread's way to move a voice between anchors built off it. No drum
+    /// calls it.
+    pub fn play_as(&mut self, preset: SynthKickSpec, tables: &Self) {
+        self.preset = preset;
+        for (run, from) in self.tables.iter_mut().zip(&tables.tables) {
+            run.period = Arc::clone(&from.period);
+            run.readings.clone_from(&from.readings);
+        }
+        self.low_cut = (preset.low_cut_hz > 0.0)
+            .then(|| Svf32::new(preset.low_cut_hz, FRAC_1_SQRT_2, self.sample_rate));
+    }
+
     fn build(
         spec: SynthKickSpec,
         periods: [Arc<[f32]>; TABLES],
