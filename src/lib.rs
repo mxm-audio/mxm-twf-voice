@@ -2778,8 +2778,9 @@ impl SynthKick {
     /// are held elsewhere too (a voice cloned from an anchor's; one built alone frees its own the
     /// first time): the audio thread's way to move a voice between anchors built off it. No drum
     /// calls it.
-    pub fn play_as(&mut self, preset: SynthKickSpec, tables: &Self) {
-        self.preset = preset;
+    /// The patch is taken by reference and copied into the voice, never onto the stack.
+    pub fn play_as(&mut self, preset: &SynthKickSpec, tables: &Self) {
+        self.preset = *preset;
         for (run, from) in self.tables.iter_mut().zip(&tables.tables) {
             run.period = Arc::clone(&from.period);
             run.readings.clone_from(&from.readings);

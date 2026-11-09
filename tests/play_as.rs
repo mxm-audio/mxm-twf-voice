@@ -93,12 +93,12 @@ fn a_voice_moved_onto_another_s_tables_plays_as_one_built_for_the_patch() {
     let mut voice = SynthKick::new(a, RATE);
     // Sounding A when it is moved, as a stolen voice is.
     let _ = rendered(&mut voice, 0.8);
-    voice.play_as(moved, &anchor);
+    voice.play_as(&moved, &anchor);
     assert_eq!(rendered(&mut voice, 0.7), rendered(&mut built, 0.7));
     // And back.
     let mut own = SynthKick::new(a, RATE);
     let from_a = SynthKick::new(a, RATE);
-    voice.play_as(a, &from_a);
+    voice.play_as(&a, &from_a);
     assert_eq!(rendered(&mut voice, 1.0), rendered(&mut own, 1.0));
 }
 
@@ -117,7 +117,7 @@ fn moving_striking_and_rendering_allocate_nothing() {
         } else {
             (a, &anchors[0])
         };
-        voice.play_as(spec, from);
+        voice.play_as(&spec, from);
         voice.strike(0.5);
         voice.render(&mut out);
     }
