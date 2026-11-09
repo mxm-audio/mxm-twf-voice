@@ -1,0 +1,17 @@
+[package]
+name = "mxm-twf-voice"
+description = "The TWF voice: Targeted Wavetable Filtering, MXM Model Drums' synthesized voice, which mxm-twf-synth's keyboard instruments play too"
+version = "0.1.0"
+edition = "2024"
+# As mxm-model-drums-dsp, whose voice it was: framework-free, its one runtime dependency the kit's
+# mxm-rng, which builds there.
+rust-version = "1.87"
+license = "GPL-3.0-or-later"
+authors = ["mxm"]
+repository = "https://github.com/mxm-audio/mxm-twf-voice"
+readme = "README.md"
+publish = false
+
+[dependencies]
+# Dependencies follow mxm-kit's main; Cargo.lock pins the exact commit.
+mxm-rng = { git = "https://github.com/mxm-audio/mxm-kit", branch = "main" }
