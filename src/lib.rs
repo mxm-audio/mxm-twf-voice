@@ -3134,6 +3134,45 @@ impl SynthKick {
         self.active
     }
 
+    /// A keyboard's voice, between blocks: once every attack is over, each part that has fallen
+    /// under `level` at the voice's output, as its park reads it (never under the park's own
+    /// level), stops where it is: a strike line, a table, the click, a noise, the bank; and the
+    /// voice parks once the whole of it has. A long ring then computes only what still sounds: a
+    /// bar's strike lines die within a second and were worked out for its whole ring
+    /// (mxm-twf-synth, 2026-11-10: three fifths of 32 notes' cost). What it takes away was under
+    /// `level`.
+    ///
+    /// **The drums never call it**, so they play bit for bit as before and pay nothing for it (the
+    /// workspace's rule for this voice).
+    pub fn park_quiet(&mut self, level: f64) {
+        if !self.active || (self.age as f64) <= self.attacks {
+            return;
+        }
+        let level = level.max(PARK_LEVEL) / (self.velocity * self.spec.output_gain.abs());
+        for p in self.partials.iter_mut().filter(|p| p.level > 0.0) {
+            if p.loudness() < level {
+                p.level = 0.0;
+            }
+        }
+        self.partials_sounding = self.partials.iter().any(|p| p.level > 0.0);
+        for t in self.tables.iter_mut().filter(|t| t.level > 0.0) {
+            if t.loudness() < level {
+                t.level = 0.0;
+            }
+        }
+        for n in [&mut self.click, &mut self.noise, &mut self.noise2] {
+            if n.level > 0.0 && n.loudness() < level {
+                n.level = 0.0;
+            }
+        }
+        if self.bank.level > 0.0 && self.bank.loudness() < level {
+            self.bank.level = 0.0;
+        }
+        if self.loudest() < level {
+            self.active = false;
+        }
+    }
+
     /// Silence at once: panic, not a musical gesture.
     pub fn reset(&mut self) {
         self.active = false;

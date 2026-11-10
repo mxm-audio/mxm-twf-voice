@@ -31,3 +31,16 @@ against the drums as the contract asks: all 57 patches' fingerprints identical b
 their cost examples alternated over six rounds, three in each order, the total within 0.3 % and
 every case the same in each order (the one-slot case read 0.9 % first in a round and 1.0 %
 second, whichever binary it was).
+
+## `park_quiet`, the keyboard's second (2026-11-10)
+
+A bar's strike lines die within a second, but each was worked out every sample until the whole
+note parked, 100 dB under its own peak, 13 to 16 s for a bass bar: three fifths of mxm-twf-synth's
+cost, 32 notes at 29.9 % of one core (the owner: "this is using extreme amounts of cpu").
+`park_quiet(level)` stops each part under the level asked, by setting its level to 0, which every
+section already reads as off; the keyboard's engine asks before each block, at -140 dB of full
+scale over the note's gain: 32 notes 9.7 %, a note every 0.1 s 18.3 % against 38.3 %. `tick` is
+unchanged and the drums never ask. Checked as the contract asks, against the voice the drums lock
+(`e1389ae`): all 57 patches' fingerprints identical; their cost examples alternated over six
+rounds, three in each order, the total -0.13 %, every case within its print's resolution (idle
+read 0.3 or 0.4 in either binary, three of six at 0.4 before and four after).

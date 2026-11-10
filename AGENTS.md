@@ -24,6 +24,8 @@ every drum: the plan's §2.
   from.
 - `tests/play_as.rs`: a voice moved onto another's tables (`SynthKick::play_as`, a keyboard's)
   plays as one built for the patch, and moving, striking and rendering allocate nothing.
+- `tests/park_quiet.rs`: a keyboard's voice stops each part under a level asked
+  (`SynthKick::park_quiet`), never in an attack, and takes away no more than it was.
 - Root: `Cargo.toml`, `Cargo.lock`, `LICENSE`, `NOTICE.md`, `TRADEMARKS.md`, `README.md`,
   `CONTRIBUTING.md`, `.github/`.
 
@@ -37,10 +39,14 @@ every drum: the plan's §2.
     (*Verification*), before and after;
   - **costs every other consumer no more CPU**: each consumer's cost examples before and after
     (Model Drums' `model_drums_synth_kick_cost` and `model_drums_engine_cost`; mxm-twf-synth's
-    once it has one), release, subnormals flushed, the median of three runs; a change that costs
+    `twf_synth_cost`), release, subnormals flushed, the median of three runs; a change that costs
     one more is not kept.
 - **The mix is the sum of the sections rendered alone**; every section is off, and not run, at
   level 0.
+- **A part under a level stops only when a consumer asks** (`SynthKick::park_quiet`, a keyboard's
+  engine between blocks): its level set to 0, so it is off and not run, as above. `tick` never
+  does it of itself, so a consumer that does not ask (the drums) plays bit for bit and pays
+  nothing; the voice's own park is unchanged.
 - **`Controls::apply` is a pure function**; a strike at full velocity under neutral controls plays
   the patch exactly.
 - **Realtime shape**: tables and metal are built off the audio thread and shared (`Arc`); a
