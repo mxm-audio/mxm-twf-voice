@@ -1,6 +1,6 @@
 [package]
 name = "mxm-twf-voice"
-description = "The TWF voice: Targeted Wavetable Filtering, MXM Model Drums' synthesized voice, which mxm-twf-synth's keyboard instruments play too"
+description = "The TWF voice: Targeted Wavetable Filtering, MXM Model Drums' synthesized voice"
 version = "0.1.0"
 edition = "2024"
 # As mxm-model-drums-dsp, whose voice it was: framework-free, its one runtime dependency the kit's

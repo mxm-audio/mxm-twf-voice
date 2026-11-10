@@ -21,26 +21,14 @@ code changed. Fingerprint before the lift, every patch the drums ship struck at 
 once under moved controls, 2 s at 48 kHz each, FNV-1a over the samples' bits: the 57 synthesized
 patches' combined `e77aabdc2a3dcbfb`, repeated run to run, and after it the same.
 
-## `play_as`, the keyboard's first addition (2026-11-09)
+## The drums' voice alone (2026-11-10)
 
-A strike reads everything from the patch but the tables' periods and their softer readings, which
-depend on the overtones and the grid, not on the pitch. So a keyboard's 32 voices can play any
-anchor at any key without building on the audio thread: each is a clone of an anchor's voice, and
-`play_as` hands it another anchor's periods (shared `Arc`s) and the patch moved to the key. Checked
-against the drums as the contract asks: all 57 patches' fingerprints identical before and after;
-their cost examples alternated over six rounds, three in each order, the total within 0.3 % and
-every case the same in each order (the one-slot case read 0.9 % first in a round and 1.0 %
-second, whichever binary it was).
-
-## `park_quiet`, the keyboard's second (2026-11-10)
-
-A bar's strike lines die within a second, but each was worked out every sample until the whole
-note parked, 100 dB under its own peak, 13 to 16 s for a bass bar: three fifths of mxm-twf-synth's
-cost, 32 notes at 29.9 % of one core (the owner: "this is using extreme amounts of cpu").
-`park_quiet(level)` stops each part under the level asked, by setting its level to 0, which every
-section already reads as off; the keyboard's engine asks before each block, at -140 dB of full
-scale over the note's gain: 32 notes 9.7 %, a note every 0.1 s 18.3 % against 38.3 %. `tick` is
-unchanged and the drums never ask. Checked as the contract asks, against the voice the drums lock
-(`e1389ae`): all 57 patches' fingerprints identical; their cost examples alternated over six
-rounds, three in each order, the total -0.13 %, every case within its print's resolution (idle
-read 0.3 or 0.4 in either binary, three of six at 0.4 before and four after).
+The keyboard's first additions came here, each off for the drums and checked against them as the
+contract asked: `play_as`, `park_quiet`, then `set_pitch` and `set_lowpass`, every one a method the
+drums never call, every check a fingerprint run and six alternated cost rounds. The owner: "If you
+are spending a lot of time making sure you dont change the drums, perhaps make a split in the
+code?", then, asked, "Synth gets its own copy", named `mxm-twf-synth-voice`. The keyboard's work
+still ahead (hold, a damper's release, partners, larger tables) is inside the sample loop, where
+the checks would bind on every change. mxm-twf-synth took this crate at `2be28a5` with
+`set_pitch` and `set_lowpass` into a crate of its own; the three keyboard commits here are reverted,
+so the code is again what the drums lock (`e1389ae`), and the two no longer follow each other.

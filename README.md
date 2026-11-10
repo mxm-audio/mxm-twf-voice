@@ -1,9 +1,9 @@
 # mxm-twf-voice
 
 The TWF voice: **Targeted Wavetable Filtering**, the synthesized voice of
-[MXM Model Drums](https://github.com/mxm-audio/mxm-model-drums), shared with
-[mxm-twf-synth](https://github.com/mxm-audio/mxm-twf-synth), whose keyboard instruments (struck and
-plucked: a marimba, a bass, a guitar, a piano) play the same voice.
+[MXM Model Drums](https://github.com/mxm-audio/mxm-model-drums).
+[mxm-twf-synth](https://github.com/mxm-audio/mxm-twf-synth)'s keyboard instruments play a copy of
+it, changed for keys, since 2026-11-10.
 
 A sound is built from three things:
 
