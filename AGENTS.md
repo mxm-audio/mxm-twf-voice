@@ -11,8 +11,9 @@ its DSP crate with its history on 2026-11-09 (ops' `plans/plan-mxm-twf.md` D2 an
 name and home the owner's). **The drums' voice alone since 2026-11-10**: `mxm-twf-synth` took its
 own copy, `mxm-twf-synth-voice`, so a keyboard's change no longer has to be proved harmless to the
 drums (the owner: "If you are spending a lot of time making sure you dont change the drums,
-perhaps make a split in the code?"; [NOTES.md](NOTES.md)). **Private**, a repository of its own,
-GPL-3.0-or-later as the drums are. Framework-free: no GUI or plugin types, one runtime dependency
+perhaps make a split in the code?"; [NOTES.md](NOTES.md)). A repository of its own, public
+with the drums since 2026-11-22 (the owner: "If they are out in beta, their repos should also be published"), GPL-3.0-or-later as the
+drums are. Framework-free: no GUI or plugin types, one runtime dependency
 (the kit's `mxm-rng`).
 
 The technique: Model Drums' `docs/drum-synthesis.md`.

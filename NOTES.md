@@ -7,8 +7,9 @@ The reasoning behind [AGENTS.md](AGENTS.md).
 ops' `plans/plan-mxm-twf.md` D2 and ruling 10. The keyboard synth is a new synth of its own (the
 owner: "This should ba new synths"), `mxm-twf-synth` ("mxm-twf-synth is the name"), and "It is ok
 to make some crates for shared code if there is any." The drums' TWF voice is that code. Its name,
-`mxm-twf-voice`, and its home, a private repository of its own rather than mxm-kit (public, MIT),
-are the owner's choices, asked for. "But the sharec code must not come at the cost of more CPU for
+`mxm-twf-voice`, and its home, a repository of its own rather than mxm-kit (MIT), are the owner's
+choices, asked for; it went public with the drums on 2026-11-22, once they were out to the beta
+testers (the owner: "If they are out in beta, their repos should also be published"). "But the sharec code must not come at the cost of more CPU for
 any consumer of the code": every change is measured in every consumer (AGENTS.md).
 
 ## How it was lifted
